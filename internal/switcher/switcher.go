@@ -362,45 +362,44 @@ type DeviceResult struct {
 	Err     error
 }
 
-// NextAll moves every device to one common target, so they always travel
-// together. Moving each device to the host after its own holder would send
-// devices that sit on different computers in opposite directions.
-//
-// The target is the host after this computer if any device is connected
-// here, otherwise the host after the first device's holder (with nothing
-// connected anywhere, the host after this computer). Devices already on the
-// target are left alone, and so are devices connected nowhere: they're
-// usually turned off, and waiting for them would only time out.
+// ErrNothingHere is returned by NextAll when no device is connected to this
+// computer, so there is nothing for it to send away.
+var ErrNothingHere = errors.New("no shared device is connected to this computer, so there is nothing to send (run `btshare here` to bring devices here)")
+
+// NextAll sends the devices connected to this computer to the next computer
+// in cycle order, all to the same one. A computer only moves what it has:
+// devices connected to other computers, or to none (usually turned off),
+// are left alone, so a press on one computer never takes a device away
+// from another.
 func (s *Switcher) NextAll(ctx context.Context, devs []config.Device) (string, []DeviceResult, error) {
 	statuses := make([][]HostResult, len(devs))
 	holders := make([]string, len(devs))
-	from := ""
+	mine := false
 	for i, d := range devs {
 		t := time.Now()
 		statuses[i] = s.Status(ctx, d)
 		s.logResults("status "+d.Name, statuses[i], since(t))
 		holders[i], _ = Holder(statuses[i])
-		if holders[i] == s.Self || (from == "" && holders[i] != "") {
-			from = holders[i]
-		}
+		mine = mine || holders[i] == s.Self
 	}
-	if from == "" {
-		from = s.Self
+	if !mine {
+		s.logf("next: %v", ErrNothingHere)
+		return "", nil, ErrNothingHere
 	}
-	target, err := s.nextAfter(from, func(h string) bool {
+	target, err := s.nextAfter(s.Self, func(h string) bool {
 		for i, d := range devs {
-			if usableOn(d, statuses[i], h) {
+			if holders[i] == s.Self && usableOn(d, statuses[i], h) {
 				return true
 			}
 		}
 		return false
 	})
 	if err != nil {
-		err = errors.New("no other reachable host has any of these devices paired")
+		err = errors.New("no other reachable computer has the devices connected here paired")
 		s.logf("next: %v", err)
 		return "", nil, err
 	}
-	s.logf("next: all devices %q -> %q", from, target)
+	s.logf("next: devices on %q -> %q", s.Self, target)
 
 	// The devices move in parallel: one that is slow or failing (e.g. a
 	// 15s connect timeout) mustn't delay the others.
@@ -410,10 +409,10 @@ func (s *Switcher) NextAll(ctx context.Context, devs []config.Device) (string, [
 		r := &out[i]
 		r.Device = d
 		switch {
-		case holders[i] == target:
-			r.Skipped = "already on " + target
 		case holders[i] == "":
 			r.Skipped = "not connected to any computer (turned off?)"
+		case holders[i] != s.Self:
+			r.Skipped = "on " + holders[i] + ", not this computer"
 		case !usableOn(d, statuses[i], target):
 			r.Err = fmt.Errorf("not set up on %s (%s)", target, whyNotUsable(d, statuses[i], target))
 		default:
