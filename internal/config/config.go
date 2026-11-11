@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -45,9 +46,18 @@ var (
 )
 
 // DefaultPath returns $BTSHARE_CONFIG or ~/.config/btshare/config.toml.
+// Under sudo it uses the invoking user's config, not root's, so commands
+// like `sudo btshare keys export mouse` work without extra flags.
 func DefaultPath() string {
 	if p := os.Getenv("BTSHARE_CONFIG"); p != "" {
 		return p
+	}
+	if os.Geteuid() == 0 {
+		if name := os.Getenv("SUDO_USER"); name != "" && name != "root" {
+			if u, err := user.Lookup(name); err == nil {
+				return filepath.Join(u.HomeDir, ".config", "btshare", "config.toml")
+			}
+		}
 	}
 	dir, err := os.UserConfigDir()
 	if err != nil {

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -50,11 +51,15 @@ Use:
   btshare keys export <device|MAC> [-o file]     (root) export pairing keys
   btshare keys import <file> [-set-address] [-no-restart]  (root) install them
   btshare gen-secret                  print a random shared secret
+  btshare version                     print the installed version
 
 Global flags (before the command):
   -config path    config file (default $BTSHARE_CONFIG or ~/.config/btshare/config.toml)
   -notify         also report the result with notify-send (for hotkeys)
 `
+
+// version is set at build time by install.sh (-ldflags "-X main.version=...").
+var version = "dev"
 
 var (
 	configPath = flag.String("config", config.DefaultPath(), "config file")
@@ -113,6 +118,8 @@ func main() {
 		err = runSwitch(ctx, device, "@"+cmd)
 	case "keys":
 		err = runKeys(ctx, rest)
+	case "version", "--version":
+		fmt.Println(version)
 	case "gen-secret":
 		fmt.Println(genSecret())
 	case "help", "-h", "--help":
@@ -481,7 +488,7 @@ func runKeys(ctx context.Context, args []string) error {
 		if len(mac) != 17 || strings.Count(mac, ":") != 5 {
 			cfg, err := config.Load(*configPath)
 			if err != nil {
-				return fmt.Errorf("%q is not a MAC and config is unavailable (under sudo, pass -config or the MAC): %w", args[1], err)
+				return fmt.Errorf("%q is not a MAC and config is unavailable (pass -config or the MAC): %w", args[1], err)
 			}
 			d, err := cfg.Device(args[1])
 			if err != nil {
@@ -504,6 +511,9 @@ func runKeys(ctx context.Context, args []string) error {
 				return err
 			}
 			defer f.Close()
+			if err := chownToSudoUser(f); err != nil {
+				return err
+			}
 			w = f
 		}
 		if err := b.Write(w); err != nil {
@@ -561,6 +571,20 @@ func runKeys(ctx context.Context, args []string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown keys subcommand %q", args[0])
+}
+
+// chownToSudoUser gives a file created under sudo back to the invoking
+// user, so they can copy it to the other computer.
+func chownToSudoUser(f *os.File) error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	uid, err1 := strconv.Atoi(os.Getenv("SUDO_UID"))
+	gid, err2 := strconv.Atoi(os.Getenv("SUDO_GID"))
+	if err1 != nil || err2 != nil {
+		return nil
+	}
+	return f.Chown(uid, gid)
 }
 
 func adapterAddress(adapter string) (string, error) {

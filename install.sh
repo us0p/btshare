@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
-# btshare installer. Run as your normal user; sudo is only requested (with
-# your confirmation) to open the firewall port.
+# btshare installer. Run as your normal user; sudo is requested (with your
+# confirmation) to install the binary system-wide and to open the firewall.
+# Re-run it at any time to update: it pulls new commits (if this is a git
+# checkout), rebuilds, reinstalls, and restarts the agent, keeping your config.
 #
 #   ./install.sh                     first computer: creates a new group
 #   ./install.sh --join 10.0.0.5     other computers: join the group of 10.0.0.5
+#   ./install.sh                     later: update this computer
 #   ./install.sh --uninstall [--purge]
 set -euo pipefail
 
+ORIG_ARGS=("$@")
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PREFIX="${PREFIX:-$HOME/.local}"
-BIN="$PREFIX/bin/btshare"
+# Root-owned and in sudo's secure_path, so `sudo btshare keys ...` works.
+SYS_BIN="${BTSHARE_SYS_BIN:-/usr/local/bin/btshare}"
+# Fallback when system-wide install is declined (also where old versions lived).
+USER_BIN="${PREFIX:-$HOME/.local}/bin/btshare"
 CONFIG="${BTSHARE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/btshare/config.toml}"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/btshare/install.state"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="btshare-agent.service"
 HOTKEY_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/btshare/"
 MK="org.gnome.settings-daemon.plugins.media-keys"
 
-JOIN="" NAME="" PORT="7531" FIREWALL=1 HOTKEY=1 UNINSTALL=0 PURGE=0 ASSUME_YES=0
+JOIN="" NAME="" PORT="7531" FIREWALL=1 HOTKEY=1 PULL=1 UNINSTALL=0 PURGE=0 ASSUME_YES=0
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 step() { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
@@ -35,13 +42,14 @@ confirm() {
 }
 
 usage() {
-	sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
 	cat <<EOF
 
 Options:
   --join ADDR      join the group of the computer at ADDR (ip or ip:port)
   --name NAME      this computer's name in the group (default: hostname)
-  --port PORT      agent port (default 7531)
+  --port PORT      agent port for a new config (default 7531)
+  --no-pull        don't check the git remote for updates
   --no-firewall    don't offer to open the firewall port
   --no-hotkey      don't offer to create the GNOME keyboard shortcut
   --yes            answer yes to every confirmation (sudo may still ask for your password)
@@ -54,6 +62,7 @@ while (($#)); do
 	--join) JOIN=${2:?--join needs an address}; shift ;;
 	--name) NAME=${2:?--name needs a value}; shift ;;
 	--port) PORT=${2:?--port needs a value}; shift ;;
+	--no-pull) PULL=0 ;;
 	--no-firewall) FIREWALL=0 ;;
 	--no-hotkey) HOTKEY=0 ;;
 	--yes | -y) ASSUME_YES=1 ;;
@@ -68,10 +77,25 @@ done
 [[ $EUID -ne 0 ]] || die "run as your normal user, not root; sudo is requested only when needed"
 [[ $PORT =~ ^[0-9]+$ ]] && ((PORT > 0 && PORT < 65536)) || die "invalid port $PORT"
 
+# ------------------------------------------------------------------- state
+# Remembers what earlier runs did, so updates don't ask the same questions.
+
+state_get() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | tail -1; }
+state_set() {
+	mkdir -p "$(dirname "$STATE")"
+	{ grep -v "^$1=" "$STATE" 2>/dev/null || true; echo "$1=$2"; } >"$STATE.tmp"
+	mv "$STATE.tmp" "$STATE"
+}
+
+# Path of the currently installed binary, if any.
+installed_bin() {
+	if [[ -x $SYS_BIN ]]; then echo "$SYS_BIN"; elif [[ -x $USER_BIN ]]; then echo "$USER_BIN"; fi
+}
+
 # ---------------------------------------------------------------- firewall
 
 firewall_kind() {
-	if command -v ufw >/dev/null && grep -qs '^ENABLED=yes' /etc/ufw/ufw.conf; then
+	if command -v ufw >/dev/null && grep -qs "^ENABLED=yes" "${BTSHARE_UFW_CONF:-/etc/ufw/ufw.conf}"; then
 		echo ufw
 	elif command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld; then
 		echo firewalld
@@ -97,12 +121,24 @@ firewall_cmds() {
 }
 
 configure_firewall() {
-	local action=$1 port=$2 ip subnet cmds
+	local action=$1 port=$2 ip subnet cmds rule
 	read -r ip subnet < <("$BIN" net-info) || { warn "could not detect LAN subnet; skipping firewall"; return; }
 	if [[ -z $(firewall_kind) ]]; then
 		echo "No active ufw or firewalld found, so there's nothing to $action."
 		echo "If you filter traffic with your own nftables/iptables rules, allow TCP $port from $subnet."
 		return
+	fi
+	rule="$(firewall_kind) $subnet $port"
+	if [[ $action == open && $(state_get firewall) == "$rule" ]]; then
+		echo "Already allowed: TCP $port from $subnet ($(firewall_kind))."
+		return
+	fi
+	if [[ $action == close ]]; then
+		# Close the rule we actually opened, even if the network changed since.
+		local saved
+		saved=$(state_get firewall)
+		[[ -n $saved ]] || { echo "No firewall rule was opened by btshare."; return; }
+		read -r _ subnet port <<<"$saved"
 	fi
 	cmds=$(firewall_cmds "$action" "$subnet" "$port")
 	if [[ $action == open ]]; then
@@ -115,6 +151,7 @@ configure_firewall() {
 	sed 's/^/    /' <<<"$cmds"
 	if confirm "Run with sudo now?"; then
 		while read -r c; do eval "$c"; done <<<"$cmds"
+		if [[ $action == open ]]; then state_set firewall "$rule"; else state_set firewall ""; fi
 	else
 		warn "skipped; run the command(s) above yourself, or other computers can't reach this one"
 	fi
@@ -140,30 +177,128 @@ hotkey_list_edit() { # add|remove
 }
 
 configure_hotkey() {
+	local want="$BIN -notify next"
 	gnome_hotkeys_available || {
 		echo "GNOME not detected. Bind this command to a key in your desktop's settings:"
-		echo "    $BIN -notify next"
+		echo "    $want"
 		return
 	}
-	local schema="$MK.custom-keybinding:$HOTKEY_PATH"
-	if [[ $(gsettings get "$schema" command 2>/dev/null) == *btshare* ]]; then
-		echo "Keyboard shortcut already set: $(gsettings get "$schema" binding)"
+	local schema="$MK.custom-keybinding:$HOTKEY_PATH" cur
+	cur=$(gsettings get "$schema" command 2>/dev/null || true)
+	if [[ $cur == *btshare* ]]; then
+		if [[ $cur != "'$want'" ]]; then
+			gsettings set "$schema" command "$want"
+			echo "Updated shortcut $(gsettings get "$schema" binding) to run: $want"
+		else
+			echo "Keyboard shortcut already set: $(gsettings get "$schema" binding)"
+		fi
+		return
+	fi
+	if [[ $(state_get hotkey) == declined ]]; then
+		echo "Shortcut previously declined. Command to bind: $want"
 		return
 	fi
 	if confirm "Create the keyboard shortcut Super+Alt+B to move shared devices to the next computer?"; then
 		gsettings set "$schema" name 'btshare: move devices to next computer'
-		gsettings set "$schema" command "$BIN -notify next"
+		gsettings set "$schema" command "$want"
 		gsettings set "$schema" binding '<Super><Alt>b'
 		hotkey_list_edit add
+		state_set hotkey created
 		echo "Shortcut created (change it in Settings → Keyboard → Custom Shortcuts)."
 	else
-		echo "Skipped. Command to bind later: $BIN -notify next"
+		state_set hotkey declined
+		echo "Skipped. Command to bind later: $want"
+	fi
+}
+
+# ------------------------------------------------------------ self-update
+
+# If this is a git checkout tracking a remote, offer to pull new commits and
+# restart the installer from the updated source.
+self_update() {
+	((PULL)) && [[ -z ${BTSHARE_INSTALLER_UPDATED:-} ]] || return 0
+	git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+	local upstream behind
+	upstream=$(git -C "$SRC" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || return 0
+	step "Checking $upstream for updates"
+	if ! git -C "$SRC" fetch --quiet 2>/dev/null; then
+		warn "could not reach the git remote; installing the current source"
+		return 0
+	fi
+	behind=$(git -C "$SRC" rev-list --count 'HEAD..@{u}')
+	if ((behind == 0)); then
+		echo "source is up to date"
+		return 0
+	fi
+	if [[ -n $(git -C "$SRC" status --porcelain --untracked-files=no) ]]; then
+		warn "$behind new commit(s) on $upstream, but you have local changes; not pulling"
+		return 0
+	fi
+	git -C "$SRC" log --oneline 'HEAD..@{u}' | sed 's/^/    /'
+	if confirm "Pull these $behind commit(s) before installing?"; then
+		git -C "$SRC" pull --ff-only --quiet || die "git pull failed; resolve it and re-run"
+		# git replaced install.sh on disk; run the new version.
+		BTSHARE_INSTALLER_UPDATED=1 exec "$SRC/install.sh" "${ORIG_ARGS[@]}"
+	fi
+}
+
+# ------------------------------------------------------------ install bin
+
+install_binary() {
+	local built=$1 old_bin
+	old_bin=$(installed_bin)
+	CHANGED=1
+	[[ -n $old_bin ]] && cmp -s "$built" "$old_bin" && CHANGED=0
+
+	if [[ $(state_get bin) != user ]]; then
+		if [[ -x $SYS_BIN ]] && cmp -s "$built" "$SYS_BIN"; then
+			echo "$SYS_BIN is already up to date"
+			BIN=$SYS_BIN
+		else
+			if [[ $(state_get bin) != system ]]; then
+				echo "btshare is installed to $SYS_BIN (owned by root) so that it's also"
+				echo "available to sudo, which 'sudo btshare keys ...' needs. This will run:"
+				echo "    sudo install -o root -g root -m 0755 $built $SYS_BIN"
+			fi
+			# Approval is remembered: updates then only need your sudo password.
+			if [[ $(state_get bin) == system ]] || confirm "Install system-wide with sudo?"; then
+				sudo install -o root -g root -m 0755 "$built" "$SYS_BIN"
+				state_set bin system
+				BIN=$SYS_BIN
+				echo "installed $SYS_BIN"
+			fi
+		fi
+	fi
+
+	if [[ ${BIN:-} != "$SYS_BIN" ]]; then
+		install -Dm755 "$built" "$USER_BIN"
+		BIN=$USER_BIN
+		state_set bin user
+		echo "installed $USER_BIN"
+		warn "sudo can't find $USER_BIN; use 'sudo $USER_BIN keys ...' (re-run with BTSHARE_RESET_BIN=1 ./install.sh to install system-wide)"
+		case ":$PATH:" in *":$(dirname "$USER_BIN"):"*) ;; *) warn "$(dirname "$USER_BIN") is not in your PATH" ;; esac
+	elif [[ -e $USER_BIN ]]; then
+		# A copy from an older install would shadow the system one in PATH.
+		rm -f "$USER_BIN"
+		echo "removed old copy $USER_BIN"
+	fi
+	hash -r
+
+	if [[ -n $old_bin ]]; then
+		local new_ver
+		new_ver=$("$BIN" version)
+		if [[ $OLD_VERSION != "$new_ver" ]]; then
+			bold "Updated btshare $OLD_VERSION → $new_ver"
+		elif [[ $CHANGED == 1 ]]; then
+			bold "Reinstalled btshare $new_ver (rebuilt from modified source)"
+		fi
 	fi
 }
 
 # --------------------------------------------------------------- uninstall
 
 if ((UNINSTALL)); then
+	BIN=$(installed_bin)
 	step "Stopping the agent"
 	systemctl --user disable --now "$UNIT" 2>/dev/null || true
 	rm -f "$UNIT_DIR/$UNIT"
@@ -173,12 +308,17 @@ if ((UNINSTALL)); then
 		gsettings reset-recursively "$MK.custom-keybinding:$HOTKEY_PATH"
 		hotkey_list_edit remove
 	fi
-	if [[ -x $BIN ]]; then
-		port=$(sed -n 's/^listen = ".*:\([0-9]*\)"/\1/p' "$CONFIG" 2>/dev/null || true)
+	if [[ -n $BIN ]]; then
 		step "Firewall"
-		configure_firewall close "${port:-$PORT}"
-		rm -f "$BIN"
+		configure_firewall close "$PORT"
 	fi
+	step "Removing binaries"
+	rm -f "$USER_BIN"
+	if [[ -e $SYS_BIN ]]; then
+		echo "This will run: sudo rm -f $SYS_BIN"
+		if confirm "Remove it?"; then sudo rm -f "$SYS_BIN"; else warn "kept $SYS_BIN"; fi
+	fi
+	rm -f "$STATE"
 	if ((PURGE)); then
 		rm -rf "$(dirname "$CONFIG")"
 		echo "Removed $(dirname "$CONFIG")."
@@ -191,6 +331,17 @@ fi
 
 # ----------------------------------------------------------------- install
 
+self_update
+
+[[ -z ${BTSHARE_RESET_BIN:-} ]] || state_set bin ""
+
+OLD_BIN=$(installed_bin)
+OLD_VERSION=""
+[[ -z $OLD_BIN ]] || OLD_VERSION=$("$OLD_BIN" version 2>/dev/null || echo "an older version")
+if [[ -n $OLD_BIN ]]; then
+	bold "Updating the existing installation ($OLD_BIN, ${OLD_VERSION})"
+fi
+
 step "Checking requirements"
 command -v go >/dev/null || die "Go is required to build btshare (https://go.dev/dl/)"
 command -v systemctl >/dev/null || die "systemd is required"
@@ -199,14 +350,17 @@ systemctl is-active --quiet bluetooth || warn "bluetooth.service is not running 
 echo "ok"
 
 step "Building"
-(cd "$SRC" && go build -trimpath -o bin/btshare ./cmd/btshare)
-install -Dm755 "$SRC/bin/btshare" "$BIN"
-echo "installed $BIN"
-case ":$PATH:" in *":$PREFIX/bin:"*) ;; *) warn "$PREFIX/bin is not in your PATH; add it to use 'btshare' directly" ;; esac
+VERSION=$(git -C "$SRC" describe --tags --always --dirty 2>/dev/null || echo dev)
+(cd "$SRC" && go build -trimpath -ldflags "-X main.version=$VERSION" -o bin/btshare ./cmd/btshare)
+echo "built btshare $VERSION"
+
+step "Installing"
+install_binary "$SRC/bin/btshare"
 
 step "Configuration"
 export BTSHARE_CONFIG="$CONFIG"
 if [[ -f $CONFIG ]]; then
+	"$BIN" invite >/dev/null || die "existing $CONFIG is invalid; fix it, or move it away to create a new one"
 	echo "Keeping existing $CONFIG"
 	PORT=$(sed -n 's/^listen = ".*:\([0-9]*\)"/\1/p' "$CONFIG")
 	PORT=${PORT:-7531}
@@ -234,6 +388,7 @@ step "Starting the agent"
 install -Dm644 "$SRC/contrib/$UNIT" "$UNIT_DIR/$UNIT"
 sed -i "s|^ExecStart=.*|ExecStart=$BIN agent|" "$UNIT_DIR/$UNIT"
 systemctl --user daemon-reload
+systemctl --user reset-failed "$UNIT" 2>/dev/null || true
 systemctl --user enable "$UNIT" >/dev/null 2>&1
 systemctl --user restart "$UNIT"
 for _ in $(seq 20); do
@@ -241,7 +396,7 @@ for _ in $(seq 20); do
 	sleep 0.25
 done
 if systemctl --user is-active --quiet "$UNIT"; then
-	echo "agent running (logs: journalctl --user -u $UNIT -f)"
+	echo "agent running $("$BIN" version) (logs: journalctl --user -u $UNIT -f)"
 else
 	journalctl --user -u "$UNIT" -n 10 --no-pager >&2 || true
 	die "agent failed to start"
@@ -266,6 +421,7 @@ cat <<EOF
 
 Next steps:
   • Share a device:        btshare device add mouse "MX Vertical"   (btshare device list shows paired devices)
-  • Copy its pairing to the other computers: see "Pairing" in $SRC/README.md
+  • Copy its pairing:      sudo btshare keys export mouse -o mouse.bundle.json   (see README)
   • Add another computer:  btshare invite
+  • Update later:          re-run $SRC/install.sh
 EOF
