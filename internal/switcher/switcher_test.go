@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/us0p/btshare/internal/bluez"
 	"github.com/us0p/btshare/internal/node"
@@ -18,15 +19,17 @@ type world struct {
 	t      *testing.T
 	mu     sync.Mutex
 	holder string
+	events []string // "unblock pc2", "release pc1", in order
 }
 
 type fakeHost struct {
-	w        *world
-	name     string
-	known    bool
-	blocked  bool
-	down     bool // unreachable
-	failConn bool
+	w           *world
+	name        string
+	known       bool
+	blocked     bool
+	down        bool // unreachable
+	failConn    bool
+	failRelease bool // release errors without letting go
 }
 
 var errDown = errors.New("connection refused")
@@ -51,6 +54,10 @@ func (f *fakeHost) Release(context.Context, string) (bluez.DeviceState, error) {
 	if f.down {
 		return bluez.DeviceState{}, errDown
 	}
+	f.w.events = append(f.w.events, "release "+f.name)
+	if f.failRelease {
+		return f.st(), errors.New("disconnect: busy")
+	}
 	if f.known {
 		if f.w.holder == f.name {
 			f.w.holder = ""
@@ -60,24 +67,43 @@ func (f *fakeHost) Release(context.Context, string) (bluez.DeviceState, error) {
 	return f.st(), nil
 }
 
-func (f *fakeHost) Acquire(context.Context, string) (bluez.DeviceState, error) {
+// Acquire behaves like BlueZ: it unblocks the device, then waits until the
+// device is free (released elsewhere) and connects, or gives up with ctx.
+func (f *fakeHost) Acquire(ctx context.Context, _ string) (bluez.DeviceState, error) {
 	f.w.mu.Lock()
-	defer f.w.mu.Unlock()
 	if f.down {
+		f.w.mu.Unlock()
 		return bluez.DeviceState{}, errDown
 	}
 	if !f.known {
+		defer f.w.mu.Unlock()
 		return f.st(), bluez.ErrUnknownDevice
 	}
 	f.blocked = false
-	if f.failConn {
-		return f.st(), errors.New("page timeout")
+	f.w.events = append(f.w.events, "unblock "+f.name)
+	f.w.mu.Unlock()
+	for {
+		f.w.mu.Lock()
+		if !f.failConn && (f.w.holder == "" || f.w.holder == f.name) {
+			f.w.holder = f.name
+			defer f.w.mu.Unlock()
+			return f.st(), nil
+		}
+		f.w.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			f.w.mu.Lock()
+			defer f.w.mu.Unlock()
+			return f.st(), errors.New("page timeout")
+		case <-time.After(time.Millisecond):
+		}
 	}
-	if f.w.holder != "" && f.w.holder != f.name {
-		f.w.t.Errorf("%s connected while %s still holds the device", f.name, f.w.holder)
-	}
-	f.w.holder = f.name
-	return f.st(), nil
+}
+
+func init() {
+	// Keep failing acquires fast; the fakes answer instantly.
+	AcquireTimeout = 100 * time.Millisecond
+	HeadStart = 5 * time.Millisecond
 }
 
 func setup(t *testing.T, holder string, hosts ...*fakeHost) (*Switcher, *world) {
@@ -201,5 +227,29 @@ func TestNextWithNoHolderStartsAfterSelf(t *testing.T) {
 	}
 	if w.holder != "pc2" {
 		t.Fatalf("holder=%s", w.holder)
+	}
+}
+
+func TestTargetListensBeforeHolderReleases(t *testing.T) {
+	pc1 := &fakeHost{name: "pc1", known: true}
+	pc2 := &fakeHost{name: "pc2", known: true, blocked: true}
+	s, w := setup(t, "pc1", pc1, pc2)
+	if _, err := s.Switch(context.Background(), mac, "pc2"); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.events) < 2 || w.events[0] != "unblock pc2" || w.events[1] != "release pc1" {
+		t.Fatalf("events %v: pc2 must be unblocked before pc1 lets go", w.events)
+	}
+}
+
+func TestAbortedSwitchReblocksTarget(t *testing.T) {
+	pc1 := &fakeHost{name: "pc1", known: true, failRelease: true}
+	pc2 := &fakeHost{name: "pc2", known: true, blocked: true}
+	s, w := setup(t, "pc1", pc1, pc2)
+	if _, err := s.Switch(context.Background(), mac, "pc2"); err == nil {
+		t.Fatal("expected error")
+	}
+	if w.holder != "pc1" || !pc2.blocked {
+		t.Fatalf("holder=%s pc2.blocked=%v", w.holder, pc2.blocked)
 	}
 }

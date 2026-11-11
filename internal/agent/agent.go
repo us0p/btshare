@@ -47,6 +47,7 @@ func (s *Server) Handler() http.Handler {
 	})))
 	mux.HandleFunc("POST /v1/join", s.authed(s.join))
 	mux.HandleFunc("POST /v1/device", s.authed(s.addDevice))
+	mux.HandleFunc("POST /v1/device/remove", s.authed(s.removeDevice))
 	return mux
 }
 
@@ -160,6 +161,26 @@ func (s *Server) addDevice(w http.ResponseWriter, r *http.Request, body []byte) 
 		return
 	}
 	s.logf("device: %s %s from %s (changed=%v)", req.Device.Name, req.Device.MAC, r.RemoteAddr, changed)
+	writeJSON(w, http.StatusOK, node.ErrorResponse{})
+}
+
+func (s *Server) removeDevice(w http.ResponseWriter, r *http.Request, body []byte) {
+	var req node.DeviceRequest
+	if err := json.Unmarshal(body, &req); err != nil || req.Device.MAC == "" {
+		writeJSON(w, http.StatusBadRequest, node.ErrorResponse{Error: "bad device request"})
+		return
+	}
+	var removed bool
+	_, err := config.Update(s.ConfigPath, func(c *config.Config) error {
+		removed = c.RemoveDevice(req.Device.MAC)
+		return nil
+	})
+	if err != nil {
+		s.notifyError("Failed to remove device "+req.Device.Name, err.Error())
+		writeJSON(w, http.StatusConflict, node.ErrorResponse{Error: err.Error()})
+		return
+	}
+	s.logf("device removed: %s %s from %s (was present=%v)", req.Device.Name, req.Device.MAC, r.RemoteAddr, removed)
 	writeJSON(w, http.StatusOK, node.ErrorResponse{})
 }
 

@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/syslog"
 	"net"
 	"net/http"
 	"os"
@@ -40,6 +41,7 @@ Setup (install.sh runs init/join for you):
   btshare invite                      print the command to add another computer
   btshare host add <name> <ip[:port]> append a host manually (no network)
   btshare device add <name> <MAC|paired name>  share a device with all hosts
+  btshare device remove <name|MAC>    stop sharing a device, on all hosts
   btshare device list                 devices paired with this computer
 
 Use:
@@ -55,6 +57,8 @@ Use:
   btshare version                     print the installed version
 
 Global flags (before the command):
+  -v              print a detailed switch/Bluetooth trace (also always in
+                  the journal: journalctl -t btshare)
   -config path    config file (default $BTSHARE_CONFIG or ~/.config/btshare/config.toml)
   -notify         also report the result with notify-send (for hotkeys)
 `
@@ -65,7 +69,25 @@ var version = "dev"
 var (
 	configPath = flag.String("config", config.DefaultPath(), "config file")
 	notifyFlag = flag.Bool("notify", false, "send a desktop notification with the result")
+	verbose    = flag.Bool("v", false, "print the switch/Bluetooth trace to stderr (it always goes to the journal)")
 )
+
+// debugLog returns the trace logger for CLI commands. The trace always goes
+// to the journal under the "btshare" tag (journalctl -t btshare), so switches
+// started from the keyboard shortcut can be investigated later; -v also
+// prints it to stderr.
+func debugLog() func(format string, args ...any) {
+	sl, _ := syslog.New(syslog.LOG_INFO|syslog.LOG_USER, "btshare")
+	return func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		if sl != nil {
+			_ = sl.Info(msg)
+		}
+		if *verbose {
+			fmt.Fprintf(os.Stderr, "%s %s\n", time.Now().Format("15:04:05.000"), msg)
+		}
+	}
+}
 
 func main() {
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
@@ -155,11 +177,12 @@ func loadSwitcher() (*config.Config, *switcher.Switcher, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	s := &switcher.Switcher{Self: cfg.Self, Nodes: map[string]node.Node{}}
+	logf := debugLog()
+	s := &switcher.Switcher{Self: cfg.Self, Nodes: map[string]node.Node{}, Logf: logf}
 	for _, h := range cfg.Hosts {
 		s.Order = append(s.Order, h.Name)
 		if h.Name == cfg.Self {
-			l, err := node.NewLocal(cfg.Adapter)
+			l, err := node.NewLocal(cfg.Adapter, logf)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -182,7 +205,8 @@ func runAgent(ctx context.Context) error {
 	if err != nil {
 		return fail(err)
 	}
-	local, err := node.NewLocal(cfg.Adapter)
+	// The agent's stderr already goes to the journal (tag "btshare").
+	local, err := node.NewLocal(cfg.Adapter, logger.Printf)
 	if err != nil {
 		return fail(err)
 	}
@@ -352,7 +376,7 @@ func runHost(args []string) error {
 
 func runDevice(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: btshare device add|list ...")
+		return errors.New("usage: btshare device add|remove|list ...")
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -394,6 +418,24 @@ func runDevice(ctx context.Context, args []string) error {
 		}
 		fmt.Printf("sharing %s (%s) with %d computer(s)\n", args[1], mac, len(cfg.Hosts))
 		fmt.Printf("next: copy its pairing to the other computers (see `btshare keys` in the README)\n")
+		return nil
+	case "remove", "rm":
+		if len(args) != 2 {
+			return errors.New("usage: btshare device remove <name|MAC>")
+		}
+		d, warns, err := group.RemoveDevice(ctx, *configPath, args[1])
+		if err != nil {
+			return err
+		}
+		for _, w := range warns {
+			fmt.Fprintf(os.Stderr, "warning: not removed on %v (re-run when it's online)\n", w)
+		}
+		label := d.MAC
+		if d.Name != "" {
+			label = d.Name + " (" + d.MAC + ")"
+		}
+		fmt.Printf("stopped sharing %s on %d computer(s)\n", label, len(cfg.Hosts)-len(warns))
+		fmt.Printf("its Bluetooth pairing is untouched; to forget it too: bluetoothctl remove %s (on each computer)\n", d.MAC)
 		return nil
 	}
 	return fmt.Errorf("unknown device subcommand %q", args[0])

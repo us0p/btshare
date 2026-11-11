@@ -66,7 +66,12 @@ Options: `--name`, `--port`, `--no-firewall`, `--no-hotkey`, `--yes`;
 ```sh
 btshare device list                    # devices paired with this computer
 btshare device add mouse "MX Vertical" # by name or MAC; added on every computer
+btshare device remove mouse            # stop sharing it, on every computer
 ```
+
+Re-pairing some mice (e.g. Logitech) gives them a new address. Then `device add`
+the new one and `device remove` the old one. Removing never touches Bluetooth
+pairings (`bluetoothctl remove <MAC>` does).
 
 New hosts and devices are appended to each computer's config file. You can also
 add a host by hand with `btshare host add <name> <ip>`. Config files are rewritten
@@ -113,12 +118,25 @@ an agent that keeps crashing, so you get a few notifications, not an endless str
 CLI commands report through notifications too when run with `-notify`, as the hotkey does.
 Logs: `journalctl --user -u btshare-agent -f`.
 
+### Troubleshooting a switch
+
+Every switch logs a detailed trace to the journal on each computer involved:
+who held the device, each release and connect with its duration, BlueZ's exact
+error per `Connect()` attempt, and every device property change BlueZ signals
+meanwhile (`Connected`, `ServicesResolved`, ...). Read it with
+`journalctl -t btshare --since "-10 min"`, or watch it live with `btshare -v next`.
+A connect that stays "pending" with no property changes means the device was
+never heard from: it isn't advertising to this computer.
+
 ## How it works
 
 Each computer runs `btshare agent`, an HTTP service controlling local BlueZ
-over D-Bus. A switch asks every **other** computer to *release* the device
-(`Disconnect()` + `Blocked=true`, keeping the bond), then the **target** to
-*acquire* it (`Blocked=false`, `Trusted=true`, `Connect()` with retries).
+over D-Bus. A switch first asks the **target** to *acquire* the device (`Blocked=false`,
+`Trusted=true`, `Connect()` with retries), and after a 0.5 s head start asks every
+**other** computer to *release* it (`Disconnect()` + `Blocked=true`, keeping the
+bond). The target is already listening when the device drops its old
+connection, which matters for BLE devices that advertise only briefly after a
+disconnect. If the target can't connect, the device is handed back the same way.
 Offline computers are skipped. Requests are signed with HMAC-SHA256 using the
 shared secret plus a timestamp, so stale requests are rejected after 30 s; keep
 clocks in sync with NTP. Agents only touch devices listed in their config.

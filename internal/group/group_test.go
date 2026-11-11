@@ -154,3 +154,42 @@ func TestAgentNotifiesErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestDeviceRemovePropagation(t *testing.T) {
+	ctx := context.Background()
+	a, b := newMember(t, "a"), newMember(t, "b")
+	if _, w, err := Join(ctx, b.path, a.addr); err != nil || len(w) > 0 {
+		t.Fatalf("join: %v %v", err, w)
+	}
+	for _, d := range []config.Device{{Name: "mouse", MAC: "AA:BB:CC:DD:EE:80"}, {Name: "kbd", MAC: "11:22:33:44:55:66"}} {
+		if w, err := AddDevice(ctx, a.path, d); err != nil || len(w) > 0 {
+			t.Fatalf("add: %v %v", err, w)
+		}
+	}
+
+	// By name, from b: gone everywhere, the other device stays.
+	d, w, err := RemoveDevice(ctx, b.path, "mouse")
+	if err != nil || len(w) > 0 || d.MAC != "AA:BB:CC:DD:EE:80" {
+		t.Fatalf("remove: %+v %v %v", d, w, err)
+	}
+	for _, m := range []*member{a, b} {
+		cfg, _ := config.Load(m.path)
+		if cfg.HasMAC("AA:BB:CC:DD:EE:80") || !cfg.HasMAC("11:22:33:44:55:66") {
+			t.Errorf("%s devices after remove: %+v", m.name, cfg.Devices)
+		}
+	}
+
+	// Unknown name: error. A MAC only a peer has: still cleaned up there.
+	if _, _, err := RemoveDevice(ctx, b.path, "nope"); err == nil {
+		t.Error("removing an unknown name should fail")
+	}
+	if _, err := config.Update(b.path, func(c *config.Config) error { c.RemoveDevice("11:22:33:44:55:66"); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, w, err := RemoveDevice(ctx, b.path, "11:22:33:44:55:66"); err != nil || len(w) > 0 {
+		t.Fatalf("remove by MAC: %v %v", err, w)
+	}
+	if cfg, _ := config.Load(a.path); cfg.HasMAC("11:22:33:44:55:66") {
+		t.Error("peer-only device not removed from a")
+	}
+}

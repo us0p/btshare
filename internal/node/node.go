@@ -67,11 +67,14 @@ type Local struct {
 	bz *bluez.Client
 }
 
-func NewLocal(adapter string) (*Local, error) {
+// NewLocal opens this host's adapter. logf, if not nil, receives a detailed
+// trace of every release and acquire (see bluez.Client.Logf).
+func NewLocal(adapter string, logf func(format string, args ...any)) (*Local, error) {
 	bz, err := bluez.New(adapter)
 	if err != nil {
 		return nil, err
 	}
+	bz.Logf = logf
 	return &Local{bz: bz}, nil
 }
 
@@ -155,6 +158,11 @@ func (r *Remote) Join(ctx context.Context, req JoinRequest) (JoinResponse, error
 
 func (r *Remote) AddDevice(ctx context.Context, d config.Device) error {
 	return r.post(ctx, "/v1/device", DeviceRequest{Device: d}, nil)
+}
+
+// RemoveDevice asks the peer to drop the device (matched by MAC) from its config.
+func (r *Remote) RemoveDevice(ctx context.Context, d config.Device) error {
+	return r.post(ctx, "/v1/device/remove", DeviceRequest{Device: d}, nil)
 }
 
 func (r *Remote) State(ctx context.Context, mac string) (bluez.DeviceState, error) {

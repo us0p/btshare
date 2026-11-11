@@ -1,7 +1,11 @@
-// Package switcher moves a device between hosts: release everywhere except
-// the target, then acquire on the target. If the target can't connect, the
-// device is handed back to the host that had it. The device is never
-// deliberately connected to two hosts at once.
+// Package switcher moves a device between hosts. The target starts
+// acquiring first (unblocked and waiting for the device), then every other
+// host releases it: a BLE device sends only a short burst of reconnection
+// advertising right after a disconnect, so the target must already be
+// listening when that happens. If the target can't connect, the device is
+// handed back to the host that had it the same way. A device holds one
+// connection at a time, and hosts that release it block it, so it never
+// ends up connected to two hosts.
 package switcher
 
 import (
@@ -20,12 +24,33 @@ var (
 	QueryTimeout   = 4 * time.Second
 	ReleaseTimeout = 6 * time.Second
 	AcquireTimeout = 20 * time.Second
+	// HeadStart is how long the target gets to unblock the device and start
+	// connecting before the other hosts let go of it.
+	HeadStart = 500 * time.Millisecond
 )
 
 type Switcher struct {
 	Order []string             // host names, cycle order for Next
 	Nodes map[string]node.Node // by host name
 	Self  string
+	// Logf, if set, receives a timeline of each switch: who held the
+	// device, every release/acquire with its duration and error, and any
+	// rollback.
+	Logf func(format string, args ...any)
+}
+
+func (s *Switcher) logf(format string, args ...any) {
+	if s.Logf != nil {
+		s.Logf(format, args...)
+	}
+}
+
+// logResults logs one line per host for a parallel step.
+func (s *Switcher) logResults(step string, rs []HostResult, took time.Duration) {
+	for _, r := range rs {
+		s.logf("  %s on %s: connected=%v blocked=%v known=%v err=%v (step took %s)",
+			step, r.Host, r.State.Connected, r.State.Blocked, r.State.Known, r.Err, took)
+	}
 }
 
 // HostResult is the outcome of an operation on one host.
@@ -81,7 +106,10 @@ func (s *Switcher) Status(ctx context.Context, mac string) []HostResult {
 // the device. If a host that still reports the device as connected couldn't
 // release it, we abort instead of fighting over it.
 func (s *Switcher) Switch(ctx context.Context, mac, target string) (*Report, error) {
-	holder, _ := Holder(s.Status(ctx, mac))
+	t := time.Now()
+	results := s.Status(ctx, mac)
+	s.logResults("status", results, since(t))
+	holder, _ := Holder(results)
 	return s.switchFrom(ctx, mac, target, holder)
 }
 
@@ -96,21 +124,14 @@ func (s *Switcher) switchFrom(ctx context.Context, mac, target, holder string) (
 			others = append(others, h)
 		}
 	}
+	s.logf("switch %s: %q -> %q (hosts %v)", mac, holder, target, s.Order)
 	rep := &Report{Target: target}
-	rep.Released = s.forEach(ctx, ReleaseTimeout, others, func(c context.Context, n node.Node) (bluez.DeviceState, error) {
-		return n.Release(c, mac)
-	})
-	for _, r := range rep.Released {
-		if r.Err != nil && r.State.Connected {
-			return rep, fmt.Errorf("%s still holds the device and failed to release it: %w", r.Host, r.Err)
-		}
-	}
-
-	actx, cancel := context.WithTimeout(ctx, AcquireTimeout)
-	defer cancel()
-	st, err := s.Nodes[target].Acquire(actx, mac)
-	rep.Acquired = HostResult{Host: target, State: st, Err: err}
+	var err error
+	rep.Released, rep.Acquired, err = s.handoff(ctx, mac, target, others)
 	if err != nil {
+		return rep, err
+	}
+	if err := rep.Acquired.Err; err != nil {
 		err = fmt.Errorf("%s could not connect: %w", target, err)
 		if holder == "" || holder == target {
 			return rep, err
@@ -125,21 +146,67 @@ func (s *Switcher) switchFrom(ctx context.Context, mac, target, holder string) (
 // would leave the device blocked on every host.
 func (s *Switcher) restore(ctx context.Context, rep *Report, mac, target, holder string, cause error) error {
 	ctx = context.WithoutCancel(ctx)
-	// Block it on the target first: it may still connect there late, and the
-	// device must not end up on two hosts.
-	rctx, cancel := context.WithTimeout(ctx, ReleaseTimeout)
-	_, _ = s.Nodes[target].Release(rctx, mac)
-	cancel()
-
-	actx, cancel := context.WithTimeout(ctx, AcquireTimeout)
-	defer cancel()
-	st, err := s.Nodes[holder].Acquire(actx, mac)
-	rep.Restored = &HostResult{Host: holder, State: st, Err: err}
+	// Same handoff in reverse: the holder starts acquiring, then the target
+	// is blocked again so it can't grab the device late.
+	s.logf("switch %s: rolling back to %s", mac, holder)
+	_, acquired, aerr := s.handoff(ctx, mac, holder, []string{target})
+	rep.Restored = &acquired
+	err := acquired.Err
+	if aerr != nil {
+		err = aerr
+	}
 	if err != nil {
 		return fmt.Errorf("%w; giving it back to %s also failed: %v (run `btshare here` on %s)", cause, holder, err, holder)
 	}
 	return fmt.Errorf("%w; it is back on %s", cause, holder)
 }
+
+// handoff moves the device to target: target starts acquiring, and after
+// HeadStart the hosts in from release it in parallel. If a host that still
+// has the device connected fails to release it, the acquire is cancelled,
+// target is blocked again and a non-nil abort error is returned.
+func (s *Switcher) handoff(ctx context.Context, mac, target string, from []string) (released []HostResult, acquired HostResult, abort error) {
+	actx, cancel := context.WithTimeout(ctx, AcquireTimeout)
+	defer cancel()
+	t := time.Now()
+	done := make(chan HostResult, 1)
+	go func() {
+		st, err := s.Nodes[target].Acquire(actx, mac)
+		done <- HostResult{Host: target, State: st, Err: err}
+	}()
+
+	// Give the target a head start, unless it already finished (e.g. it
+	// failed at once, or the device was already connected there).
+	select {
+	case r := <-done:
+		done <- r
+	case <-time.After(HeadStart):
+	case <-ctx.Done():
+	}
+
+	rt := time.Now()
+	released = s.forEach(ctx, ReleaseTimeout, from, func(c context.Context, n node.Node) (bluez.DeviceState, error) {
+		return n.Release(c, mac)
+	})
+	s.logResults("release", released, since(rt))
+	for _, r := range released {
+		if r.Err != nil && r.State.Connected {
+			s.logf("switch %s: aborted, %s still holds it", mac, r.Host)
+			cancel()
+			<-done
+			// Undo the target's unblock so it doesn't grab the device later.
+			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), ReleaseTimeout)
+			_, _ = s.Nodes[target].Release(rctx, mac)
+			rcancel()
+			return released, HostResult{Host: target}, fmt.Errorf("%s still holds the device and failed to release it: %w", r.Host, r.Err)
+		}
+	}
+	acquired = <-done
+	s.logResults("acquire", []HostResult{acquired}, since(t))
+	return released, acquired, nil
+}
+
+func since(t time.Time) time.Duration { return time.Since(t).Round(10 * time.Millisecond) }
 
 // ErrNoHolder is returned by Holder when no host has the device connected.
 var ErrNoHolder = errors.New("no host currently has the device connected")
@@ -183,9 +250,12 @@ func (s *Switcher) NextTarget(results []HostResult) (string, error) {
 
 // Next moves the device to the next host in cycle order.
 func (s *Switcher) Next(ctx context.Context, mac string) (*Report, error) {
+	t := time.Now()
 	results := s.Status(ctx, mac)
+	s.logResults("status", results, since(t))
 	target, err := s.NextTarget(results)
 	if err != nil {
+		s.logf("next %s: %v", mac, err)
 		return nil, err
 	}
 	holder, _ := Holder(results)

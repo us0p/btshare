@@ -94,6 +94,41 @@ func AddHost(cfgPath string, h config.Host) error {
 	return err
 }
 
+// RemoveDevice stops sharing a device: it is removed from the local config
+// and from every other host's. nameOrMAC is matched against the local
+// config; a MAC that isn't there locally is still removed from the peers,
+// to clean up an entry only they have. Pairings are left alone.
+func RemoveDevice(ctx context.Context, cfgPath, nameOrMAC string) (config.Device, []Warning, error) {
+	var d config.Device
+	cfg, err := config.Update(cfgPath, func(c *config.Config) error {
+		if found, err := c.Device(nameOrMAC); err == nil {
+			d = found
+		} else if mac, merr := config.ValidMAC(nameOrMAC); merr == nil {
+			d = config.Device{MAC: mac}
+		} else {
+			return err
+		}
+		c.RemoveDevice(d.MAC)
+		return nil
+	})
+	if err != nil {
+		return d, nil, err
+	}
+	var warns []Warning
+	for _, h := range cfg.Hosts {
+		if h.Name == cfg.Self {
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, Timeout)
+		err := remote(cfg, h.Addr).RemoveDevice(cctx, d)
+		cancel()
+		if err != nil {
+			warns = append(warns, Warning{h.Name, err})
+		}
+	}
+	return d, warns, nil
+}
+
 // AddDevice appends the device locally and on every other host.
 func AddDevice(ctx context.Context, cfgPath string, d config.Device) ([]Warning, error) {
 	if err := config.ValidName(d.Name); err != nil {

@@ -218,6 +218,18 @@ func (c *Config) UpsertDevice(d Device) bool {
 	return true
 }
 
+// RemoveDevice removes the device with this MAC. Reports whether it was there.
+func (c *Config) RemoveDevice(mac string) bool {
+	mac = strings.ToUpper(mac)
+	for i, d := range c.Devices {
+		if d.MAC == mac {
+			c.Devices = append(c.Devices[:i], c.Devices[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 // RenameSelf renames this host, both in Self and in its [[hosts]] entry.
 // Reports whether anything changed.
 func (c *Config) RenameSelf(name string) (bool, error) {
