@@ -27,7 +27,7 @@ jobs:
     name: Lint and format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -46,7 +46,7 @@ jobs:
         # The minimum version from go.mod, and the latest release.
         go: [go.mod, stable]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: ${{ matrix.go == 'go.mod' && 'go.mod' || '' }}
@@ -65,7 +65,7 @@ jobs:
     name: Build and modules
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -80,7 +80,7 @@ jobs:
     name: Shell scripts and workflows
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # shellcheck comes preinstalled on GitHub's Ubuntu runners.
       - name: shellcheck
         run: shellcheck --version && shellcheck install.sh
@@ -93,7 +93,7 @@ jobs:
     name: Vulnerabilities
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # The latest Go release: the one users should build btshare with.
       - uses: actions/setup-go@v6
         with:
