@@ -83,7 +83,9 @@ done
 
 ((FRESH && UNINSTALL)) && die "--fresh and --uninstall don't go together (use --uninstall --purge to remove everything)"
 [[ $EUID -ne 0 ]] || die "run as your normal user, not root; sudo is requested only when needed"
-[[ $PORT =~ ^[0-9]+$ ]] && ((PORT > 0 && PORT < 65536)) || die "invalid port $PORT"
+if ! [[ $PORT =~ ^[0-9]+$ ]] || ((PORT < 1 || PORT > 65535)); then
+	die "invalid port $PORT"
+fi
 
 # ------------------------------------------------------------------- state
 # Remembers what earlier runs did, so updates don't ask the same questions.
@@ -156,6 +158,7 @@ configure_firewall() {
 		echo "Remove the btshare firewall rule for TCP $port from $subnet?"
 	fi
 	echo "This will run:"
+	# shellcheck disable=SC2001 # indents every line, not just the first
 	sed 's/^/    /' <<<"$cmds"
 	if confirm "Run with sudo now?"; then
 		while read -r c; do eval "$c"; done <<<"$cmds"

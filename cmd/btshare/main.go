@@ -102,6 +102,15 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if err := run(args); err != nil {
+		fmt.Fprintln(os.Stderr, "btshare:", err)
+		desktopNotify("btshare failed", err.Error())
+		os.Exit(1)
+	}
+}
+
+// run executes one command; main turns its error into the exit status.
+func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -157,11 +166,7 @@ func main() {
 	default:
 		err = fmt.Errorf("unknown command %q (see btshare help)", cmd)
 	}
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "btshare:", err)
-		desktopNotify("btshare failed", err.Error())
-		os.Exit(1)
-	}
+	return err
 }
 
 var notifier = notify.New("btshare")
@@ -225,7 +230,8 @@ func runAgent(ctx context.Context) error {
 	}
 	go func() {
 		<-ctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		// ctx is already canceled here; shutdown gets its own deadline.
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
@@ -357,10 +363,7 @@ func runJoin(ctx context.Context, args []string) error {
 	}
 	secret := *secretFlag
 	if secret == "" {
-		var err error
-		if secret, err = readSecret(addr); err != nil {
-			return err
-		}
+		secret = readSecret(addr)
 	}
 	cfg, warns, err := group.Join(ctx, *configPath, withPort(addr), secret)
 	if err != nil {
@@ -380,18 +383,19 @@ func runJoin(ctx context.Context, args []string) error {
 // device such as /dev/null).
 func isTerminal(f *os.File) bool {
 	var t syscall.Termios
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TCGETS, uintptr(unsafe.Pointer(&t)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TCGETS,
+		uintptr(unsafe.Pointer(&t))) //nolint:gosec // TCGETS only fills t, sized by the kernel's termios
 	return errno == 0
 }
 
 // readSecret asks for the group secret without echoing it. Enter keeps
 // this computer's current secret. Without a terminal it reads one line
 // from stdin (install.sh passes nothing: it has set the secret already).
-func readSecret(addr string) (string, error) {
+func readSecret(addr string) string {
 	if !isTerminal(os.Stdin) {
 		var line string
 		_, _ = fmt.Fscanln(os.Stdin, &line)
-		return strings.TrimSpace(line), nil
+		return strings.TrimSpace(line)
 	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -408,7 +412,7 @@ func readSecret(addr string) (string, error) {
 	_, _ = fmt.Fscanln(os.Stdin, &line)
 	stty("echo")
 	fmt.Fprintln(os.Stderr)
-	return strings.TrimSpace(line), nil
+	return strings.TrimSpace(line)
 }
 
 func runInvite() error {
@@ -437,7 +441,7 @@ func runHost(args []string) error {
 
 func runDevice(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: btshare device add|remove|list ...")
+		return errors.New("usage: btshare device add|remove|list")
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -697,7 +701,7 @@ func runSwitch(ctx context.Context, device, target string) error {
 
 func runKeys(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: btshare keys export|import ...")
+		return errors.New("usage: btshare keys export|import")
 	}
 	fs := flag.NewFlagSet("keys "+args[0], flag.ContinueOnError)
 	root := fs.String("root", keys.DefaultRoot, "BlueZ storage directory")
@@ -791,7 +795,7 @@ func runKeys(ctx context.Context, args []string) error {
 		}
 		if !*noRestart {
 			if out, err := exec.CommandContext(ctx, "systemctl", "restart", "bluetooth").CombinedOutput(); err != nil {
-				return fmt.Errorf("restart bluetooth: %v: %s", err, out)
+				return fmt.Errorf("restart bluetooth: %w: %s", err, out)
 			}
 			fmt.Fprintln(os.Stderr, "restarted bluetooth.service")
 		}
@@ -849,7 +853,7 @@ func setPublicAddress(adapter, addr string) error {
 	} {
 		out, err := runBtmgmt(a...)
 		if err != nil {
-			return fmt.Errorf("btmgmt %s: %v: %s", strings.Join(a, " "), err, out)
+			return fmt.Errorf("btmgmt %s: %w: %s", strings.Join(a, " "), err, out)
 		}
 	}
 	got, err := adapterAddress(adapter)

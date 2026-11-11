@@ -99,6 +99,13 @@ func Read(r io.Reader) (*Bundle, error) {
 // backed up with a .btshare.bak suffix. Returns the paths written.
 // bluetoothd must be restarted afterwards to pick them up.
 func Install(root string, b *Bundle) ([]string, error) {
+	// The addresses become path components of files written as root:
+	// never trust them unchecked, even if Read already did.
+	for _, mac := range []string{b.AdapterAddress, b.DeviceMAC} {
+		if _, err := checkMAC(mac); err != nil {
+			return nil, err
+		}
+	}
 	adir := filepath.Join(root, b.AdapterAddress)
 	ddir := filepath.Join(adir, b.DeviceMAC)
 	if err := os.MkdirAll(ddir, 0o700); err != nil {
@@ -107,6 +114,7 @@ func Install(root string, b *Bundle) ([]string, error) {
 	var written []string
 	put := func(path, content string) error {
 		if old, err := os.ReadFile(path); err == nil && string(old) != content {
+			//nolint:gosec // G703: path is root + two checked MACs + a fixed name
 			if err := os.WriteFile(path+".btshare.bak", old, 0o600); err != nil {
 				return err
 			}

@@ -155,7 +155,7 @@ func (s *Switcher) switchFrom(ctx context.Context, d config.Device, target, hold
 }
 
 // restore hands the device back to holder after target failed to connect.
-// It runs even if ctx was cancelled (e.g. Ctrl+C mid-switch): stopping here
+// It runs even if ctx was canceled (e.g. Ctrl+C mid-switch): stopping here
 // would leave the device blocked on every host.
 func (s *Switcher) restore(ctx context.Context, rep *Report, mac, target, holder string, cause error) error {
 	ctx = context.WithoutCancel(ctx)
@@ -169,14 +169,14 @@ func (s *Switcher) restore(ctx context.Context, rep *Report, mac, target, holder
 		err = aerr
 	}
 	if err != nil {
-		return fmt.Errorf("%w; giving it back to %s also failed: %v (run `btshare here` on %s)", cause, holder, err, holder)
+		return fmt.Errorf("%w; giving it back to %s also failed: %w (run `btshare here` on %s)", cause, holder, err, holder)
 	}
 	return fmt.Errorf("%w; it is back on %s", cause, holder)
 }
 
 // handoff moves the device to target: target starts acquiring, and after
 // HeadStart the hosts in from release it in parallel. If a host that still
-// has the device connected fails to release it, the acquire is cancelled,
+// has the device connected fails to release it, the acquire is canceled,
 // target is blocked again and a non-nil abort error is returned.
 func (s *Switcher) handoff(ctx context.Context, mac, target string, from []string) (released []HostResult, acquired HostResult, abort error) {
 	actx, cancel := context.WithTimeout(ctx, AcquireTimeout)
@@ -263,11 +263,11 @@ func (s *Switcher) switchChannel(ctx context.Context, d config.Device, target, h
 	rep.Acquired = <-done
 	s.logResults("acquire", []HostResult{rep.Acquired}, since(t))
 	if err := rep.Acquired.Err; err != nil {
-		switch {
-		case holder == "":
+		switch holder {
+		case "":
 			return rep, fmt.Errorf("%s could not connect: %w (no computer has %s connected, so btshare can't change its channel: press its channel button to select channel %d)",
 				target, err, d.Name, tgt.Channel)
-		case holder == target:
+		case target:
 			return rep, fmt.Errorf("%s could not connect: %w", target, err)
 		default:
 			back := ""
