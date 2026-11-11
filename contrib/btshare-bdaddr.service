@@ -12,8 +12,11 @@ Before=bluetooth.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/btmgmt --index hci0 power off
-ExecStart=/usr/bin/btmgmt --index hci0 public-addr 00:11:22:33:44:55
+# btmgmt hangs when stdin is /dev/null (systemd's default), so feed it an
+# empty pipe; the timeout keeps a stuck call from delaying boot.
+TimeoutStartSec=30
+ExecStart=/bin/sh -c ': | /usr/bin/btmgmt --index hci0 power off'
+ExecStart=/bin/sh -c ': | /usr/bin/btmgmt --index hci0 public-addr 00:11:22:33:44:55'
 
 [Install]
 WantedBy=bluetooth.target

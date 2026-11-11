@@ -657,13 +657,31 @@ func adapterAddress(adapter string) (string, error) {
 	return c.AdapterAddress()
 }
 
+// btmgmtTimeout bounds each btmgmt call; a healthy one answers in well under a second.
+const btmgmtTimeout = 10 * time.Second
+
+// runBtmgmt runs one btmgmt command. btmgmt (BlueZ 5.8x) hangs forever when
+// stdin is /dev/null, which is what exec gives a nil Stdin (it can't epoll
+// that file), so hand it an empty pipe instead, and time it out regardless.
+func runBtmgmt(args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), btmgmtTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "btmgmt", args...)
+	cmd.Stdin = strings.NewReader("") // not an *os.File, so exec uses a pipe
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return out, fmt.Errorf("no answer after %s (is bluetooth.service running?)", btmgmtTimeout)
+	}
+	return out, err
+}
+
 func setPublicAddress(adapter, addr string) error {
 	for _, a := range [][]string{
 		{"--index", adapter, "power", "off"},
 		{"--index", adapter, "public-addr", addr},
 		{"--index", adapter, "power", "on"},
 	} {
-		out, err := exec.Command("btmgmt", a...).CombinedOutput()
+		out, err := runBtmgmt(a...)
 		if err != nil {
 			return fmt.Errorf("btmgmt %s: %v: %s", strings.Join(a, " "), err, out)
 		}
