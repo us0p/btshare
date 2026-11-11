@@ -150,18 +150,19 @@ shred -u mouse.bundle.json
 ```sh
 btshare status                # who has what
 btshare switch mouse laptop   # move it to a specific computer
-btshare next                  # move every shared device to the next computer (what the hotkey runs)
+btshare next                  # send what's connected here to the next computer (what the hotkey runs)
 btshare next mouse            # move just this one to the computer after the one that has it
 btshare here                  # pull every shared device to this computer
 ```
 
 Any computer can run these, including one that doesn't have the device.
 
-With several devices, `btshare next` moves them together: everything goes
-to the computer after this one if anything is connected here, otherwise to
-the computer after the one that has them. A device that is already there
-is left alone, and so is one that isn't connected anywhere (usually because
-it's turned off), so switching doesn't stall waiting for it.
+`btshare next` only moves what is connected to the computer it runs on:
+all of those devices go to the next computer together. Devices connected to
+another computer are left alone, so a press on one computer never takes a
+device away from another. So are devices connected nowhere (usually turned
+off), so switching doesn't stall waiting for them. If nothing is connected
+here, `next` does nothing and says so; use `btshare here` to pull devices in.
 
 ### Managing devices
 
@@ -233,13 +234,17 @@ Single-host devices:
   it to wake it and it connects to X. To have it elsewhere, run `btshare here`
   on that computer. Don't forget and re-pair it: that gives it new keys (and,
   for some mice, a new address), so every computer needs the keys again.
+- *"a switch is already running on this computer"*: you pressed the hotkey
+  (or button) again while a switch was still connecting. Switches on one
+  computer run one at a time, so two can't fight over a device and leave it
+  blocked everywhere. Wait for the first to finish or fail (under a minute).
 - *"not set up on X"* from `btshare next`: X doesn't have the pairing. Copy it
   with `btshare keys export` / `keys import` (step 4b).
 
 Triggering a switch from a device's own button (for example a Solaar rule
 running `btshare -notify next`) works best with `next` and no device name:
-all devices move together, so the mouse with the button comes along and you
-can press it again on the other computer. Keep the keyboard shortcut set up
+everything on that computer moves together, so the mouse with the button
+comes along and you can press it again on the other computer. Keep the keyboard shortcut set up
 on every computer as a fallback.
 
 Multi-channel devices:

@@ -397,31 +397,29 @@ func twoDevices(t *testing.T, self, mxHolder, mouHolder string) (s *Switcher, mx
 	return s, mx, mou, []config.Device{mxDev, {Name: "mou", MAC: mac2}}, mouHosts
 }
 
-func TestNextAllMovesDevicesTogether(t *testing.T) {
-	// The mice sit on different computers. Moving each one past its own
-	// holder would swap them; next must gather both on one computer.
-	for _, self := range []string{"pc1", "pc2"} {
-		t.Run("run on "+self, func(t *testing.T) {
-			s, mx, mou, devs, _ := twoDevices(t, self, "pc2", "pc1")
-			target, res, err := s.NextAll(context.Background(), devs)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// Whatever is on the computer running next leaves it.
-			want := map[string]string{"pc1": "pc2", "pc2": "pc1"}[self]
-			if target != want || mx.holder != want || mou.holder != want {
-				t.Fatalf("target=%s mx on %s, mou on %s; want all on %s", target, mx.holder, mou.holder, want)
-			}
-			for _, r := range res {
-				if r.Err != nil {
-					t.Fatalf("%s: %v", r.Device.Name, r.Err)
-				}
-			}
-			// And the next press sends both to the other computer.
-			if target, _, err = s.NextAll(context.Background(), devs); err != nil || mx.holder != target || mou.holder != target || target == want {
-				t.Fatalf("second next: err=%v target=%s mx on %s, mou on %s", err, target, mx.holder, mou.holder)
-			}
-		})
+func TestNextAllMovesOnlyWhatIsHere(t *testing.T) {
+	// The mice sit on different computers. next on pc1 sends pc1's mouse
+	// away and leaves the one on pc2 alone.
+	s, mx, mou, devs, _ := twoDevices(t, "pc1", "pc2", "pc1")
+	target, res, err := s.NextAll(context.Background(), devs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "pc2" || mou.holder != "pc2" || mx.holder != "pc2" || len(mx.events) != 0 {
+		t.Fatalf("target=%s mou on %s, mx on %s, mx events %v", target, mou.holder, mx.holder, mx.events)
+	}
+	if res[0].Skipped == "" || res[1].Err != nil {
+		t.Fatalf("mx skipped=%q, mou err=%v", res[0].Skipped, res[1].Err)
+	}
+
+	// Now both are on pc2: pc1 has nothing to send...
+	if _, _, err := s.NextAll(context.Background(), devs); !errors.Is(err, ErrNothingHere) {
+		t.Fatalf("err=%v, want ErrNothingHere", err)
+	}
+	// ...and next on pc2 sends both to pc1 together.
+	s.Self = "pc2"
+	if target, _, err = s.NextAll(context.Background(), devs); err != nil || target != "pc1" || mx.holder != "pc1" || mou.holder != "pc1" {
+		t.Fatalf("err=%v target=%s mx on %s, mou on %s", err, target, mx.holder, mou.holder)
 	}
 }
 

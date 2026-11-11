@@ -656,7 +656,34 @@ func describe(r switcher.HostResult) string {
 
 // runSwitch moves one device, or every configured device when device is "".
 // target is a host name, "@next" or "@here".
+// switchLock makes switches on this computer run one at a time. A second
+// press of the hotkey while one is running would otherwise race it: each
+// releases and blocks the device the other is connecting, and it can end up
+// blocked on every computer. The lock is released when the process exits.
+func switchLock() error {
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	f, err := os.OpenFile(dir+"/btshare-switch.lock", os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // the user's own runtime directory
+	if err != nil {
+		return nil // can't lock: better to switch than to refuse
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return errors.New("a switch is already running on this computer; wait for it to finish (it gives up in under a minute)")
+		}
+		return nil
+	}
+	// f stays open (and locked) until the process exits.
+	return nil
+}
+
 func runSwitch(ctx context.Context, device, target string) error {
+	if err := switchLock(); err != nil {
+		return err
+	}
 	cfg, s, err := loadSwitcher()
 	if err != nil {
 		return err
