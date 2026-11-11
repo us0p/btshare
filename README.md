@@ -57,6 +57,9 @@ kept, and you aren't asked again about steps you already answered.
 Passing `--name`, `--port` or `--join` on a computer that already has a config
 updates it in place (`btshare reconfigure`), keeping its hosts and devices;
 with `--join` you're asked for the group secret (Enter keeps the current one).
+To start over instead, `./install.sh --fresh [--join ADDR]` moves the config to
+`config.toml.bak-<date>` (after asking) and sets the computer up as on a first
+install. Bluetooth pairings, the firewall rule and the shortcut are kept.
 Options: `--name`, `--port`, `--no-firewall`, `--no-hotkey`, `--yes`;
 `./install.sh --uninstall [--purge]` removes everything, including the firewall rule
 (after asking).

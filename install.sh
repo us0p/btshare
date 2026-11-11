@@ -7,6 +7,7 @@
 #   ./install.sh                     first computer: creates a new group
 #   ./install.sh --join 10.0.0.5     other computers: join the group of 10.0.0.5
 #   ./install.sh                     later: update this computer
+#   ./install.sh --fresh [--join …]  start over: discard this computer's config
 #   ./install.sh --uninstall [--purge]
 set -euo pipefail
 
@@ -23,7 +24,7 @@ UNIT="btshare-agent.service"
 HOTKEY_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/btshare/"
 MK="org.gnome.settings-daemon.plugins.media-keys"
 
-JOIN="" NAME="" PORT="7531" PORT_SET=0 FIREWALL=1 HOTKEY=1 PULL=1 UNINSTALL=0 PURGE=0 ASSUME_YES=0
+JOIN="" NAME="" PORT="7531" PORT_SET=0 FIREWALL=1 HOTKEY=1 PULL=1 UNINSTALL=0 PURGE=0 FRESH=0 ASSUME_YES=0
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 step() { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
@@ -42,7 +43,7 @@ confirm() {
 }
 
 usage() {
-	sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
 	cat <<EOF
 
 Options:
@@ -54,6 +55,9 @@ Options:
   --no-firewall    don't offer to open the firewall port
   --no-hotkey      don't offer to create the GNOME keyboard shortcut
   --yes            answer yes to every confirmation (sudo may still ask for your password)
+  --fresh          start over: back up and remove this computer's config (name,
+                   secret, computers, devices) and saved answers, then set up
+                   again as on a first install
   --uninstall      remove btshare (keeps config unless --purge)
 EOF
 }
@@ -69,12 +73,14 @@ while (($#)); do
 	--yes | -y) ASSUME_YES=1 ;;
 	--uninstall) UNINSTALL=1 ;;
 	--purge) PURGE=1 ;;
+	--fresh) FRESH=1 ;;
 	-h | --help) usage; exit 0 ;;
 	*) die "unknown option $1 (see --help)" ;;
 	esac
 	shift
 done
 
+((FRESH && UNINSTALL)) && die "--fresh and --uninstall don't go together (use --uninstall --purge to remove everything)"
 [[ $EUID -ne 0 ]] || die "run as your normal user, not root; sudo is requested only when needed"
 [[ $PORT =~ ^[0-9]+$ ]] && ((PORT > 0 && PORT < 65536)) || die "invalid port $PORT"
 
@@ -357,6 +363,33 @@ echo "built btshare $VERSION"
 
 step "Installing"
 install_binary "$SRC/bin/btshare"
+
+# --fresh: move the old config aside (not deleted, in case it's needed back)
+# and forget earlier answers, so the steps below run as on a first install.
+# Done only now that the new binary is built and installed.
+if ((FRESH)); then
+	step "Starting fresh"
+	if [[ -f $CONFIG || -f $STATE ]]; then
+		echo "This removes this computer's btshare setup and sets it up again:"
+		[[ -f $CONFIG ]] && echo "  - $CONFIG (name, group secret, computers, shared devices)"
+		[[ -f $STATE ]] && echo "  - saved installer answers (firewall, shortcut)"
+		echo "Bluetooth pairings, the firewall rule and the keyboard shortcut are kept."
+		confirm "Continue?" || die "cancelled; nothing was changed (pass --yes to skip this question)"
+		systemctl --user stop "$UNIT" 2>/dev/null || true
+		if [[ -f $CONFIG ]]; then
+			backup="$CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
+			mv "$CONFIG" "$backup"
+			rm -f "$CONFIG.lock"
+			echo "Old config moved to $backup"
+		fi
+		bin_choice=$(state_get bin)
+		rm -f "$STATE"
+		[[ -z $bin_choice ]] || state_set bin "$bin_choice"
+		echo "The other computers still list this one: rejoin their group with --join (or create a new one)."
+	else
+		echo "No previous config; nothing to remove."
+	fi
+fi
 
 step "Configuration"
 export BTSHARE_CONFIG="$CONFIG"
