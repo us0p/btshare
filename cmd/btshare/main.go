@@ -856,12 +856,34 @@ func setPublicAddress(adapter, addr string) error {
 			return fmt.Errorf("btmgmt %s: %w: %s", strings.Join(a, " "), err, out)
 		}
 	}
-	got, err := adapterAddress(adapter)
+	got, err := waitForAddress(func() (string, error) { return adapterAddress(adapter) }, addr, adapterReappearTimeout)
 	if err != nil {
-		return err
+		return fmt.Errorf("adapter %s did not come back after the address change: %w", adapter, err)
 	}
 	if !strings.EqualFold(got, addr) {
 		return fmt.Errorf("controller did not accept the new address (still %s); it likely doesn't support public-addr", got)
 	}
 	return nil
+}
+
+// adapterReappearTimeout bounds how long we wait for bluetoothd to re-register
+// the adapter after its address changes.
+const adapterReappearTimeout = 10 * time.Second
+
+// waitForAddress polls get until it reports want or timeout passes. After
+// `btmgmt public-addr` + power on, bluetoothd removes and re-adds the adapter's
+// D-Bus object, so the first reads fail or still return the old address.
+// It returns the last address read (to report a refused change) or the last error.
+func waitForAddress(get func() (string, error), want string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		got, err := get()
+		if err == nil && strings.EqualFold(got, want) {
+			return got, nil
+		}
+		if time.Now().After(deadline) {
+			return got, err
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
