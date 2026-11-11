@@ -129,9 +129,50 @@ func TestSwitchToleratesOfflineHost(t *testing.T) {
 func TestSwitchReportsAcquireFailure(t *testing.T) {
 	pc1 := &fakeHost{name: "pc1", known: true}
 	pc2 := &fakeHost{name: "pc2", known: true, failConn: true}
-	s, _ := setup(t, "pc1", pc1, pc2)
-	if _, err := s.Switch(context.Background(), mac, "pc2"); err == nil {
+	s, w := setup(t, "pc1", pc1, pc2)
+	rep, err := s.Switch(context.Background(), mac, "pc2")
+	if err == nil {
 		t.Fatal("expected error")
+	}
+	// The device goes back to pc1 instead of staying blocked everywhere.
+	if w.holder != "pc1" || pc1.blocked || !pc2.blocked {
+		t.Fatalf("holder=%s pc1.blocked=%v pc2.blocked=%v", w.holder, pc1.blocked, pc2.blocked)
+	}
+	if rep.Restored == nil || rep.Restored.Host != "pc1" || rep.Restored.Err != nil {
+		t.Fatalf("Restored=%+v", rep.Restored)
+	}
+}
+
+func TestNextRestoresHolderOnFailure(t *testing.T) {
+	pc1 := &fakeHost{name: "pc1", known: true}
+	pc2 := &fakeHost{name: "pc2", known: true, failConn: true}
+	s, w := setup(t, "pc1", pc1, pc2)
+	if _, err := s.Next(context.Background(), mac); err == nil {
+		t.Fatal("expected error")
+	}
+	if w.holder != "pc1" || pc1.blocked {
+		t.Fatalf("holder=%s pc1.blocked=%v", w.holder, pc1.blocked)
+	}
+}
+
+func TestRestoreFailureIsReported(t *testing.T) {
+	pc1 := &fakeHost{name: "pc1", known: true}
+	pc2 := &fakeHost{name: "pc2", known: true, failConn: true}
+	s, _ := setup(t, "pc1", pc1, pc2)
+	pc1.failConn = true // the original holder can't take it back either
+	rep, err := s.Switch(context.Background(), mac, "pc2")
+	if err == nil || rep.Restored == nil || rep.Restored.Err == nil {
+		t.Fatalf("err=%v Restored=%+v", err, rep.Restored)
+	}
+}
+
+func TestFailedSwitchWithNoHolderRestoresNothing(t *testing.T) {
+	pc1 := &fakeHost{name: "pc1", known: true}
+	pc2 := &fakeHost{name: "pc2", known: true, failConn: true}
+	s, _ := setup(t, "", pc1, pc2)
+	rep, err := s.Switch(context.Background(), mac, "pc2")
+	if err == nil || rep.Restored != nil {
+		t.Fatalf("err=%v Restored=%+v", err, rep.Restored)
 	}
 }
 
