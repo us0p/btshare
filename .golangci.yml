@@ -1,0 +1,57 @@
+# golangci-lint v2 configuration, used by CI and by `make lint` / `make fmt`.
+# Docs: https://golangci-lint.run/docs/configuration/file/
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - bodyclose      # HTTP response bodies must be closed (agent client)
+    - copyloopvar
+    - errorlint      # wrap with %w, compare with errors.Is/As
+    - gocritic
+    - gosec          # the agent is a network service handling a secret
+    - misspell
+    - nolintlint     # //nolint must name the linter and say why
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    gocritic:
+      enabled-tags: [diagnostic, performance]
+      disabled-checks:
+        - hugeParam # copying small structs is clearer here than pointers
+    gosec:
+      excludes:
+        - G104 # unhandled errors: errcheck covers this, with the standard exclusions
+        - G204 # subprocess with variable args: btmgmt/stty/systemctl are fixed binaries
+        - G304 # file paths come from the config, flags and sysfs, not from the network
+    misspell:
+      locale: US
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      # Tests use fixed temp paths and fake data.
+      - path: _test\.go
+        linters: [gosec, unparam]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes: [github.com/us0p/btshare]
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -264,3 +264,18 @@ clocks in sync with NTP. Agents only touch devices listed in their config.
 | `internal/switcher` | Switch / next logic |
 | `internal/keys` | Export/import of BlueZ bonds |
 | `internal/hidpp` | Multi-channel detection and switching (Logitech HID++ 2.0) |
+
+## Contributing
+
+CI (`.github/workflows/ci.yml`) runs on every push and pull request, and
+weekly: golangci-lint with the formatters (`.golangci.yml`), unit tests with
+the race detector on the minimum Go version from `go.mod` and on the latest
+release, `go mod tidy`/`verify`, a build, shellcheck on `install.sh`, and
+govulncheck. Run the same checks locally before pushing:
+
+```sh
+make fmt     # format Go code (gofmt + goimports)
+make check   # everything CI runs (shellcheck must be installed)
+```
+
+`.editorconfig` sets indentation and line endings for most editors.

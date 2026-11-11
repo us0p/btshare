@@ -108,15 +108,17 @@ func (f *fakeHost) Acquire(ctx context.Context, _ string) (bluez.DeviceState, er
 		f.w.mu.Lock()
 		if !f.failConn && f.w.channel == f.channel && (f.w.holder == "" || f.w.holder == f.name) {
 			f.w.holder = f.name
-			defer f.w.mu.Unlock()
-			return f.st(), nil
+			st := f.st()
+			f.w.mu.Unlock()
+			return st, nil
 		}
 		f.w.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			f.w.mu.Lock()
-			defer f.w.mu.Unlock()
-			return f.st(), errors.New("page timeout")
+			st := f.st()
+			f.w.mu.Unlock()
+			return st, errors.New("page timeout")
 		case <-time.After(time.Millisecond):
 		}
 	}

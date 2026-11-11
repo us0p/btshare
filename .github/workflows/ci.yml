@@ -1,0 +1,102 @@
+# Every check here can be run locally with `make check` (see Makefile).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Weekly, so newly published vulnerabilities in Go or a dependency are
+  # reported even when nobody pushes.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOLANGCI_LINT_VERSION: v2.15.0
+  GOVULNCHECK_VERSION: v1.9.0
+
+jobs:
+  lint:
+    name: Lint and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # Linters and formatters (gofmt, goimports) from .golangci.yml;
+      # a badly formatted file fails this step too.
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+
+  test:
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The minimum version from go.mod, and the latest release.
+        go: [go.mod, stable]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: ${{ matrix.go == 'go.mod' && 'go.mod' || '' }}
+          go-version: ${{ matrix.go == 'stable' && 'stable' || '' }}
+      - name: Unit tests (race detector)
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+      - name: Coverage
+        run: go tool cover -func=coverage.out | tail -1
+      - uses: actions/upload-artifact@v4
+        if: matrix.go == 'stable'
+        with:
+          name: coverage
+          path: coverage.out
+
+  build:
+    name: Build and modules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+      - name: Dependencies match go.sum
+        run: go mod verify
+      - name: Build the binary as install.sh does
+        run: go build -trimpath -o bin/btshare ./cmd/btshare && ./bin/btshare version
+
+  shell:
+    name: Shell scripts and workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # shellcheck comes preinstalled on GitHub's Ubuntu runners.
+      - name: shellcheck
+        run: shellcheck --version && shellcheck install.sh
+      - name: bash syntax
+        run: bash -n install.sh
+      - name: actionlint (this workflow)
+        run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.7 -no-color
+
+  vulncheck:
+    name: Vulnerabilities
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The latest Go release: the one users should build btshare with.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }} ./...
