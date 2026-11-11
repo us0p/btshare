@@ -35,6 +35,7 @@ const usage = `btshare - share a Bluetooth device between Linux hosts
 
 Setup (install.sh runs init/join for you):
   btshare init [-name N] [-addr IP:PORT] [-secret S]  create config for this host
+  btshare reconfigure [-name N] [-port P] [-secret S]  change an existing config
   btshare join <ip[:port]>            join the group of the computer at ip
   btshare invite                      print the command to add another computer
   btshare host add <name> <ip[:port]> append a host manually (no network)
@@ -83,6 +84,8 @@ func main() {
 		err = runAgent(ctx)
 	case "init":
 		err = runInit(rest)
+	case "reconfigure":
+		err = runReconfigure(rest)
 	case "join":
 		err = runJoin(ctx, rest)
 	case "invite":
@@ -239,6 +242,64 @@ func runInit(args []string) error {
 		return err
 	}
 	fmt.Printf("created %s for host %q at %s\n", *configPath, *name, *addr)
+	return nil
+}
+
+// runReconfigure changes this host's name, port or secret in an existing
+// config, keeping its hosts and devices. install.sh uses it when it is run
+// with --name/--port/--join on a computer that already has a config.
+func runReconfigure(args []string) error {
+	fs := flag.NewFlagSet("reconfigure", flag.ContinueOnError)
+	name := fs.String("name", "", "new name for this host")
+	port := fs.String("port", "", "new agent port")
+	secret := fs.String("secret", "", "new shared secret (use the group's secret when joining)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return errors.New("usage: btshare reconfigure [-name N] [-port P] [-secret S]")
+	}
+	var changes []string
+	var peers int
+	_, err := config.Update(*configPath, func(c *config.Config) error {
+		peers = len(c.Hosts) - 1
+		if *name != "" {
+			old := c.Self
+			changed, err := c.RenameSelf(*name)
+			if err != nil {
+				return err
+			}
+			if changed {
+				changes = append(changes, fmt.Sprintf("name %s -> %s", old, *name))
+			}
+		}
+		if *port != "" {
+			changed, err := c.SetPort(*port)
+			if err != nil {
+				return err
+			}
+			if changed {
+				changes = append(changes, "port "+*port)
+			}
+		}
+		if *secret != "" && *secret != c.Secret {
+			c.Secret = *secret
+			changes = append(changes, "secret")
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(changes) == 0 {
+		fmt.Println("config unchanged")
+		return nil
+	}
+	fmt.Printf("updated %s: %s\n", *configPath, strings.Join(changes, ", "))
+	if peers > 0 {
+		fmt.Fprintf(os.Stderr, "warning: the %d other computer(s) in this config still have the old settings; "+
+			"run `btshare join` against one of them to re-announce this computer\n", peers)
+	}
 	return nil
 }
 

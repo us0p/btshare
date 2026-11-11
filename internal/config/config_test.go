@@ -99,3 +99,45 @@ func TestConcurrentUpdatesDontLoseEntries(t *testing.T) {
 		t.Fatalf("got %d hosts, want 21", len(c.Hosts))
 	}
 }
+
+func TestRenameSelf(t *testing.T) {
+	c := base()
+	c.Hosts = append(c.Hosts, Host{Name: "laptop", Addr: "10.0.0.2:7531"})
+	if changed, err := c.RenameSelf("desktop"); err != nil || changed {
+		t.Fatalf("same name: changed=%v err=%v", changed, err)
+	}
+	if _, err := c.RenameSelf("laptop"); err == nil {
+		t.Fatal("renamed onto another host's name")
+	}
+	if _, err := c.RenameSelf("bad name"); err == nil {
+		t.Fatal("accepted invalid name")
+	}
+	if changed, err := c.RenameSelf("office"); err != nil || !changed {
+		t.Fatalf("rename: changed=%v err=%v", changed, err)
+	}
+	if c.Self != "office" || c.Hosts[0].Name != "office" || c.Hosts[1].Name != "laptop" {
+		t.Fatalf("after rename: %+v", c)
+	}
+	c.defaults()
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSetPort(t *testing.T) {
+	c := base()
+	c.Listen = ":7531"
+	c.Hosts = append(c.Hosts, Host{Name: "laptop", Addr: "10.0.0.2:7531"})
+	if changed, err := c.SetPort("7531"); err != nil || changed {
+		t.Fatalf("same port: changed=%v err=%v", changed, err)
+	}
+	if _, err := c.SetPort("70000"); err == nil {
+		t.Fatal("accepted invalid port")
+	}
+	if changed, err := c.SetPort("8000"); err != nil || !changed {
+		t.Fatalf("set port: changed=%v err=%v", changed, err)
+	}
+	if c.Listen != ":8000" || c.Hosts[0].Addr != "10.0.0.1:8000" || c.Hosts[1].Addr != "10.0.0.2:7531" {
+		t.Fatalf("after set port: %+v", c)
+	}
+}

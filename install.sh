@@ -23,7 +23,7 @@ UNIT="btshare-agent.service"
 HOTKEY_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/btshare/"
 MK="org.gnome.settings-daemon.plugins.media-keys"
 
-JOIN="" NAME="" PORT="7531" FIREWALL=1 HOTKEY=1 PULL=1 UNINSTALL=0 PURGE=0 ASSUME_YES=0
+JOIN="" NAME="" PORT="7531" PORT_SET=0 FIREWALL=1 HOTKEY=1 PULL=1 UNINSTALL=0 PURGE=0 ASSUME_YES=0
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 step() { printf '\n\033[1;34m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
@@ -48,7 +48,8 @@ usage() {
 Options:
   --join ADDR      join the group of the computer at ADDR (ip or ip:port)
   --name NAME      this computer's name in the group (default: hostname)
-  --port PORT      agent port for a new config (default 7531)
+                   --name, --port and --join also update an existing config
+  --port PORT      agent port (default 7531)
   --no-pull        don't check the git remote for updates
   --no-firewall    don't offer to open the firewall port
   --no-hotkey      don't offer to create the GNOME keyboard shortcut
@@ -61,7 +62,7 @@ while (($#)); do
 	case $1 in
 	--join) JOIN=${2:?--join needs an address}; shift ;;
 	--name) NAME=${2:?--name needs a value}; shift ;;
-	--port) PORT=${2:?--port needs a value}; shift ;;
+	--port) PORT=${2:?--port needs a value}; PORT_SET=1; shift ;;
 	--no-pull) PULL=0 ;;
 	--no-firewall) FIREWALL=0 ;;
 	--no-hotkey) HOTKEY=0 ;;
@@ -359,19 +360,36 @@ install_binary "$SRC/bin/btshare"
 
 step "Configuration"
 export BTSHARE_CONFIG="$CONFIG"
+# ask_secret [hint] -> sets SECRET to the group secret typed by the user.
+ask_secret() {
+	interactive || die "--join needs a terminal to enter the group secret"
+	echo "On the computer at $JOIN, run 'btshare invite' to see the group secret."
+	read -rsp "Group secret${1:+ ($1)}: " SECRET
+	echo
+}
+
 if [[ -f $CONFIG ]]; then
 	"$BIN" invite >/dev/null || die "existing $CONFIG is invalid; fix it, or move it away to create a new one"
-	echo "Keeping existing $CONFIG"
+	args=()
+	[[ -n $NAME ]] && args+=(-name "$NAME")
+	((PORT_SET)) && args+=(-port "$PORT")
+	if [[ -n $JOIN ]]; then
+		ask_secret "Enter to keep the current one"
+		[[ -n $SECRET ]] && args+=(-secret "$SECRET")
+		unset SECRET
+	fi
+	if ((${#args[@]})); then
+		"$BIN" reconfigure "${args[@]}"
+	else
+		echo "Keeping existing $CONFIG"
+	fi
 	PORT=$(sed -n 's/^listen = ".*:\([0-9]*\)"/\1/p' "$CONFIG")
 	PORT=${PORT:-7531}
 else
 	args=(-port "$PORT")
 	[[ -n $NAME ]] && args+=(-name "$NAME")
 	if [[ -n $JOIN ]]; then
-		interactive || die "--join needs a terminal to enter the group secret"
-		echo "On the computer at $JOIN, run 'btshare invite' to see the group secret."
-		read -rsp "Group secret: " SECRET
-		echo
+		ask_secret
 		[[ -n $SECRET ]] || die "empty secret"
 		args+=(-secret "$SECRET")
 		unset SECRET

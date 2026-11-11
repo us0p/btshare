@@ -12,6 +12,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -215,6 +216,50 @@ func (c *Config) UpsertDevice(d Device) bool {
 	}
 	c.Devices = append(c.Devices, d)
 	return true
+}
+
+// RenameSelf renames this host, both in Self and in its [[hosts]] entry.
+// Reports whether anything changed.
+func (c *Config) RenameSelf(name string) (bool, error) {
+	if err := ValidName(name); err != nil {
+		return false, err
+	}
+	if name == c.Self {
+		return false, nil
+	}
+	if _, err := c.Host(name); err == nil {
+		return false, fmt.Errorf("host name %q is already used by another computer in this config", name)
+	}
+	for i := range c.Hosts {
+		if c.Hosts[i].Name == c.Self {
+			c.Hosts[i].Name = name
+		}
+	}
+	c.Self = name
+	return true, nil
+}
+
+// SetPort changes the agent port, both in Listen and in this host's address.
+// Reports whether anything changed.
+func (c *Config) SetPort(port string) (bool, error) {
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return false, fmt.Errorf("invalid port %q", port)
+	}
+	changed := false
+	if lh, lp, err := net.SplitHostPort(c.Listen); err == nil && lp != port {
+		c.Listen = net.JoinHostPort(lh, port)
+		changed = true
+	}
+	for i := range c.Hosts {
+		if c.Hosts[i].Name != c.Self {
+			continue
+		}
+		if h, p, err := net.SplitHostPort(c.Hosts[i].Addr); err == nil && p != port {
+			c.Hosts[i].Addr = net.JoinHostPort(h, port)
+			changed = true
+		}
+	}
+	return changed, nil
 }
 
 // Create writes a new config; it refuses to overwrite an existing one.
