@@ -1,0 +1,15 @@
+# Installed and configured by install.sh.
+[Unit]
+Description=btshare agent (share Bluetooth devices between computers)
+After=network-online.target bluetooth.target
+# Don't spam desktop notifications if the agent keeps crashing.
+StartLimitIntervalSec=120
+StartLimitBurst=4
+
+[Service]
+ExecStart=%h/.local/bin/btshare agent
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

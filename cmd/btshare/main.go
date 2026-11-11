@@ -1,0 +1,594 @@
+// Command btshare moves a Bluetooth device (mouse, keyboard, headset...)
+// between Linux hosts on the same LAN, so it is only connected to one at a time.
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/us0p/btshare/internal/agent"
+	"github.com/us0p/btshare/internal/bluez"
+	"github.com/us0p/btshare/internal/config"
+	"github.com/us0p/btshare/internal/group"
+	"github.com/us0p/btshare/internal/keys"
+	"github.com/us0p/btshare/internal/netinfo"
+	"github.com/us0p/btshare/internal/node"
+	"github.com/us0p/btshare/internal/notify"
+	"github.com/us0p/btshare/internal/switcher"
+)
+
+const usage = `btshare - share a Bluetooth device between Linux hosts
+
+Setup (install.sh runs init/join for you):
+  btshare init [-name N] [-addr IP:PORT] [-secret S]  create config for this host
+  btshare join <ip[:port]>            join the group of the computer at ip
+  btshare invite                      print the command to add another computer
+  btshare host add <name> <ip[:port]> append a host manually (no network)
+  btshare device add <name> <MAC|paired name>  share a device with all hosts
+  btshare device list                 devices paired with this computer
+
+Use:
+  btshare agent                       run the LAN agent (one per host)
+  btshare status [device]             show which host holds each device
+  btshare switch <device> <host>      move device to host
+  btshare next   [device]             move device(s) to the next host (cycle)
+  btshare here   [device]             move device(s) to this host
+                                      (no device: every shared device)
+  btshare keys export <device|MAC> [-o file]     (root) export pairing keys
+  btshare keys import <file> [-set-address] [-no-restart]  (root) install them
+  btshare gen-secret                  print a random shared secret
+
+Global flags (before the command):
+  -config path    config file (default $BTSHARE_CONFIG or ~/.config/btshare/config.toml)
+  -notify         also report the result with notify-send (for hotkeys)
+`
+
+var (
+	configPath = flag.String("config", config.DefaultPath(), "config file")
+	notifyFlag = flag.Bool("notify", false, "send a desktop notification with the result")
+)
+
+func main() {
+	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
+	flag.Parse()
+	args := flag.Args()
+	if len(args) == 0 {
+		flag.Usage()
+		os.Exit(2)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var err error
+	switch cmd, rest := args[0], args[1:]; cmd {
+	case "agent":
+		err = runAgent(ctx)
+	case "init":
+		err = runInit(rest)
+	case "join":
+		err = runJoin(ctx, rest)
+	case "invite":
+		err = runInvite()
+	case "host":
+		err = runHost(rest)
+	case "device":
+		err = runDevice(ctx, rest)
+	case "net-info": // used by install.sh
+		ip, subnet, e := netinfo.LAN()
+		if e != nil {
+			err = e
+			break
+		}
+		fmt.Println(ip, subnet)
+	case "status":
+		err = runStatus(ctx, rest)
+	case "switch":
+		if len(rest) != 2 {
+			err = errors.New("usage: btshare switch <device> <host>")
+			break
+		}
+		err = runSwitch(ctx, rest[0], rest[1])
+	case "next", "here":
+		if len(rest) > 1 {
+			err = fmt.Errorf("usage: btshare %s [device]  (no device: all shared devices)", cmd)
+			break
+		}
+		device := ""
+		if len(rest) == 1 {
+			device = rest[0]
+		}
+		err = runSwitch(ctx, device, "@"+cmd)
+	case "keys":
+		err = runKeys(ctx, rest)
+	case "gen-secret":
+		fmt.Println(genSecret())
+	case "help", "-h", "--help":
+		flag.Usage()
+	default:
+		err = fmt.Errorf("unknown command %q (see btshare help)", cmd)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "btshare:", err)
+		desktopNotify("btshare failed", err.Error())
+		os.Exit(1)
+	}
+}
+
+var notifier = notify.New("btshare")
+
+func desktopNotify(title, body string) {
+	if !*notifyFlag {
+		return
+	}
+	if strings.Contains(title, "failed") {
+		notifier.Error(title, body)
+	} else {
+		notifier.Info(title, body)
+	}
+}
+
+func loadSwitcher() (*config.Config, *switcher.Switcher, error) {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	s := &switcher.Switcher{Self: cfg.Self, Nodes: map[string]node.Node{}}
+	for _, h := range cfg.Hosts {
+		s.Order = append(s.Order, h.Name)
+		if h.Name == cfg.Self {
+			l, err := node.NewLocal(cfg.Adapter)
+			if err != nil {
+				return nil, nil, err
+			}
+			s.Nodes[h.Name] = l
+		} else {
+			s.Nodes[h.Name] = &node.Remote{Addr: h.Addr, Secret: []byte(cfg.Secret)}
+		}
+	}
+	return cfg, s, nil
+}
+
+func runAgent(ctx context.Context) error {
+	logger := log.New(os.Stderr, "", log.LstdFlags)
+	// The agent runs in the background: every failure must reach the desktop.
+	fail := func(err error) error {
+		notifier.Error("btshare agent stopped", err.Error())
+		return err
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return fail(err)
+	}
+	local, err := node.NewLocal(cfg.Adapter)
+	if err != nil {
+		return fail(err)
+	}
+	srv := &http.Server{
+		Addr: cfg.Listen,
+		Handler: (&agent.Server{
+			Node: local, Secret: []byte(cfg.Secret), ConfigPath: *configPath,
+			Notify: notifier, Log: logger,
+		}).Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}()
+	logger.Printf("btshare agent %q listening on %s (adapter %s, %d hosts, %d devices)",
+		cfg.Self, cfg.Listen, cfg.Adapter, len(cfg.Hosts), len(cfg.Devices))
+	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		return fail(err)
+	}
+	return nil
+}
+
+func runInit(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
+	name := fs.String("name", "", "this host's name (default: hostname)")
+	addr := fs.String("addr", "", "address peers use to reach this host (default: LAN IP:port)")
+	port := fs.String("port", config.DefaultPort, "agent port")
+	secret := fs.String("secret", "", "shared secret (default: generate; use the group's secret when joining)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *name == "" {
+		h, err := os.Hostname()
+		if err != nil {
+			return err
+		}
+		*name = strings.SplitN(h, ".", 2)[0]
+	}
+	if *addr == "" {
+		ip, _, err := netinfo.LAN()
+		if err != nil {
+			return fmt.Errorf("detect LAN address (pass -addr): %w", err)
+		}
+		*addr = ip.String() + ":" + *port
+	}
+	if *secret == "" {
+		*secret = genSecret()
+	}
+	c := &config.Config{
+		Self: *name, Secret: *secret, Listen: ":" + *port,
+		Hosts: []config.Host{{Name: *name, Addr: *addr}},
+	}
+	if err := config.Create(*configPath, c); err != nil {
+		return err
+	}
+	fmt.Printf("created %s for host %q at %s\n", *configPath, *name, *addr)
+	return nil
+}
+
+func withPort(addr string) string {
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		return net.JoinHostPort(addr, config.DefaultPort)
+	}
+	return addr
+}
+
+func runJoin(ctx context.Context, args []string) error {
+	if len(args) != 1 {
+		return errors.New("usage: btshare join <ip[:port]>")
+	}
+	cfg, warns, err := group.Join(ctx, *configPath, withPort(args[0]))
+	if err != nil {
+		return err
+	}
+	for _, w := range warns {
+		fmt.Fprintf(os.Stderr, "warning: could not announce this computer to %v\n", w)
+	}
+	fmt.Printf("joined: %d computers, %d shared devices\n", len(cfg.Hosts), len(cfg.Devices))
+	for _, h := range cfg.Hosts {
+		fmt.Printf("  %-12s %s\n", h.Name, h.Addr)
+	}
+	return nil
+}
+
+func runInvite() error {
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	self, _ := cfg.Host(cfg.Self)
+	fmt.Printf("On the other computer, from the btshare source directory, run:\n\n"+
+		"  ./install.sh --join %s\n\nand paste this secret when asked:\n\n  %s\n", self.Addr, cfg.Secret)
+	return nil
+}
+
+func runHost(args []string) error {
+	if len(args) != 3 || args[0] != "add" {
+		return errors.New("usage: btshare host add <name> <ip[:port]>")
+	}
+	if err := group.AddHost(*configPath, config.Host{Name: args[1], Addr: withPort(args[2])}); err != nil {
+		return err
+	}
+	fmt.Printf("added %s; it must use the same secret (see `btshare invite`)\n", args[1])
+	return nil
+}
+
+func runDevice(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: btshare device add|list ...")
+	}
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "list":
+		bz, err := bluez.New(cfg.Adapter)
+		if err != nil {
+			return err
+		}
+		defer bz.Close()
+		paired, err := bz.Paired()
+		if err != nil {
+			return err
+		}
+		for _, p := range paired {
+			shared := ""
+			if d, err := cfg.Device(p.MAC); err == nil {
+				shared = "shared as " + d.Name
+			}
+			fmt.Printf("%s  %-28s %s\n", p.MAC, p.Name, shared)
+		}
+		return nil
+	case "add":
+		if len(args) != 3 {
+			return errors.New("usage: btshare device add <name> <MAC|paired device name>")
+		}
+		mac, err := resolveMAC(cfg, args[2])
+		if err != nil {
+			return err
+		}
+		warns, err := group.AddDevice(ctx, *configPath, config.Device{Name: args[1], MAC: mac})
+		if err != nil {
+			return err
+		}
+		for _, w := range warns {
+			fmt.Fprintf(os.Stderr, "warning: not added on %v (re-run when it's online)\n", w)
+		}
+		fmt.Printf("sharing %s (%s) with %d computer(s)\n", args[1], mac, len(cfg.Hosts))
+		fmt.Printf("next: copy its pairing to the other computers (see `btshare keys` in the README)\n")
+		return nil
+	}
+	return fmt.Errorf("unknown device subcommand %q", args[0])
+}
+
+// resolveMAC accepts a MAC or the name of a device paired with this host.
+func resolveMAC(cfg *config.Config, arg string) (string, error) {
+	if mac, err := config.ValidMAC(arg); err == nil {
+		return mac, nil
+	}
+	bz, err := bluez.New(cfg.Adapter)
+	if err != nil {
+		return "", err
+	}
+	defer bz.Close()
+	paired, err := bz.Paired()
+	if err != nil {
+		return "", err
+	}
+	var hits []bluez.PairedDevice
+	for _, p := range paired {
+		if strings.EqualFold(p.Name, arg) {
+			return p.MAC, nil
+		}
+		if strings.Contains(strings.ToLower(p.Name), strings.ToLower(arg)) {
+			hits = append(hits, p)
+		}
+	}
+	if len(hits) == 1 {
+		return hits[0].MAC, nil
+	}
+	return "", fmt.Errorf("%q matches %d paired devices; pass the MAC (see `btshare device list`)", arg, len(hits))
+}
+
+func genSecret() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b)
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func runStatus(ctx context.Context, args []string) error {
+	cfg, s, err := loadSwitcher()
+	if err != nil {
+		return err
+	}
+	devs := cfg.Devices
+	if len(args) == 1 {
+		d, err := cfg.Device(args[0])
+		if err != nil {
+			return err
+		}
+		devs = []config.Device{d}
+	}
+	for _, d := range devs {
+		fmt.Printf("%s (%s)\n", d.Name, d.MAC)
+		for _, r := range s.Status(ctx, d.MAC) {
+			marker := " "
+			if r.Host == cfg.Self {
+				marker = "*"
+			}
+			fmt.Printf("  %s %-12s %s\n", marker, r.Host, describe(r))
+		}
+	}
+	return nil
+}
+
+func describe(r switcher.HostResult) string {
+	switch {
+	case r.Err != nil:
+		return "error: " + r.Err.Error()
+	case !r.State.Known:
+		return "not paired"
+	case r.State.Connected:
+		return "CONNECTED"
+	case r.State.Blocked:
+		return "released"
+	default:
+		return "idle"
+	}
+}
+
+// runSwitch moves one device, or every configured device when device is "".
+// target is a host name, "@next" or "@here".
+func runSwitch(ctx context.Context, device, target string) error {
+	cfg, s, err := loadSwitcher()
+	if err != nil {
+		return err
+	}
+	devs := cfg.Devices
+	if device != "" {
+		d, err := cfg.Device(device)
+		if err != nil {
+			return err
+		}
+		devs = []config.Device{d}
+	}
+	if len(devs) == 0 {
+		return errors.New("no shared devices yet (add one with `btshare device add`)")
+	}
+	var moved, failed []string
+	for _, d := range devs {
+		var rep *switcher.Report
+		var err error
+		switch target {
+		case "@next":
+			rep, err = s.Next(ctx, d.MAC)
+		case "@here":
+			rep, err = s.Switch(ctx, d.MAC, cfg.Self)
+		default:
+			rep, err = s.Switch(ctx, d.MAC, target)
+		}
+		if rep != nil {
+			for _, r := range rep.Released {
+				if r.Err != nil {
+					fmt.Fprintf(os.Stderr, "warning: %s: %s: %v\n", d.Name, r.Host, r.Err)
+				}
+			}
+		}
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", d.Name, err))
+			continue
+		}
+		msg := fmt.Sprintf("%s → %s", d.Name, rep.Target)
+		fmt.Println(msg)
+		moved = append(moved, msg)
+	}
+	if len(moved) > 0 {
+		desktopNotify("btshare", strings.Join(moved, "\n"))
+	}
+	if len(failed) > 0 {
+		return errors.New(strings.Join(failed, "; "))
+	}
+	return nil
+}
+
+func runKeys(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: btshare keys export|import ...")
+	}
+	fs := flag.NewFlagSet("keys "+args[0], flag.ContinueOnError)
+	root := fs.String("root", keys.DefaultRoot, "BlueZ storage directory")
+	adapter := fs.String("adapter", "hci0", "local adapter")
+	switch args[0] {
+	case "export":
+		out := fs.String("o", "", "output file (default stdout)")
+		if len(args) < 2 {
+			return errors.New("usage: btshare keys export <device|MAC> [-o file]")
+		}
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		mac := strings.ToUpper(args[1])
+		if len(mac) != 17 || strings.Count(mac, ":") != 5 {
+			cfg, err := config.Load(*configPath)
+			if err != nil {
+				return fmt.Errorf("%q is not a MAC and config is unavailable (under sudo, pass -config or the MAC): %w", args[1], err)
+			}
+			d, err := cfg.Device(args[1])
+			if err != nil {
+				return err
+			}
+			mac = d.MAC
+		}
+		addr, err := adapterAddress(*adapter)
+		if err != nil {
+			return err
+		}
+		b, err := keys.Export(*root, addr, mac)
+		if err != nil {
+			return err
+		}
+		w := os.Stdout
+		if *out != "" {
+			f, err := os.OpenFile(*out, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			w = f
+		}
+		if err := b.Write(w); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "exported bond for %s (adapter %s). This file contains secret keys: move it securely and delete it after import.\n", mac, addr)
+		return nil
+
+	case "import":
+		setAddr := fs.Bool("set-address", false, "change this adapter's address to the bundle's (btmgmt public-addr)")
+		noRestart := fs.Bool("no-restart", false, "don't restart bluetooth.service")
+		if len(args) < 2 {
+			return errors.New("usage: btshare keys import <file> [-set-address] [-no-restart]")
+		}
+		if err := fs.Parse(args[2:]); err != nil {
+			return err
+		}
+		f, err := os.Open(args[1])
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		b, err := keys.Read(f)
+		if err != nil {
+			return err
+		}
+		local, err := adapterAddress(*adapter)
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(local, b.AdapterAddress) {
+			if !*setAddr {
+				return fmt.Errorf("this adapter is %s but the device is bonded to %s.\n"+
+					"The device only reconnects to the address it was paired with, so this host must use it too.\n"+
+					"Re-run with -set-address (needs a controller that supports changing its public address)", local, b.AdapterAddress)
+			}
+			if err := setPublicAddress(*adapter, b.AdapterAddress); err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "adapter %s address set to %s (not persistent across reboots; see README)\n", *adapter, b.AdapterAddress)
+		}
+		paths, err := keys.Install(*root, b)
+		if err != nil {
+			return err
+		}
+		for _, p := range paths {
+			fmt.Fprintln(os.Stderr, "wrote", p)
+		}
+		if !*noRestart {
+			if out, err := exec.CommandContext(ctx, "systemctl", "restart", "bluetooth").CombinedOutput(); err != nil {
+				return fmt.Errorf("restart bluetooth: %v: %s", err, out)
+			}
+			fmt.Fprintln(os.Stderr, "restarted bluetooth.service")
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown keys subcommand %q", args[0])
+}
+
+func adapterAddress(adapter string) (string, error) {
+	c, err := bluez.New(adapter)
+	if err != nil {
+		return "", err
+	}
+	defer c.Close()
+	return c.AdapterAddress()
+}
+
+func setPublicAddress(adapter, addr string) error {
+	for _, a := range [][]string{
+		{"--index", adapter, "power", "off"},
+		{"--index", adapter, "public-addr", addr},
+		{"--index", adapter, "power", "on"},
+	} {
+		out, err := exec.Command("btmgmt", a...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("btmgmt %s: %v: %s", strings.Join(a, " "), err, out)
+		}
+	}
+	got, err := adapterAddress(adapter)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(got, addr) {
+		return fmt.Errorf("controller did not accept the new address (still %s); it likely doesn't support public-addr", got)
+	}
+	return nil
+}
