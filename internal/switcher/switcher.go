@@ -402,7 +402,10 @@ func (s *Switcher) NextAll(ctx context.Context, devs []config.Device) (string, [
 	}
 	s.logf("next: all devices %q -> %q", from, target)
 
+	// The devices move in parallel: one that is slow or failing (e.g. a
+	// 15s connect timeout) mustn't delay the others.
 	out := make([]DeviceResult, len(devs))
+	var wg sync.WaitGroup
 	for i, d := range devs {
 		r := &out[i]
 		r.Device = d
@@ -414,12 +417,17 @@ func (s *Switcher) NextAll(ctx context.Context, devs []config.Device) (string, [
 		case !usableOn(d, statuses[i], target):
 			r.Err = fmt.Errorf("not set up on %s (%s)", target, whyNotUsable(d, statuses[i], target))
 		default:
-			r.Report, r.Err = s.switchFrom(ctx, d, target, holders[i])
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				r.Report, r.Err = s.switchFrom(ctx, d, target, holders[i])
+			}()
 		}
 		if r.Skipped != "" {
 			s.logf("next %s: left on %q: %s", d.Name, holders[i], r.Skipped)
 		}
 	}
+	wg.Wait()
 	return target, out, nil
 }
 

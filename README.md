@@ -233,6 +233,10 @@ Single-host devices:
   it to wake it and it connects to X. To have it elsewhere, run `btshare here`
   on that computer. Don't forget and re-pair it: that gives it new keys (and,
   for some mice, a new address), so every computer needs the keys again.
+- *"a switch is already running on this computer"*: you pressed the hotkey
+  (or button) again while a switch was still connecting. Switches on one
+  computer run one at a time, so two can't fight over a device and leave it
+  blocked everywhere. Wait for the first to finish or fail (under a minute).
 - *"not set up on X"* from `btshare next`: X doesn't have the pairing. Copy it
   with `btshare keys export` / `keys import` (step 4b).
 
