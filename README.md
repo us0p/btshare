@@ -35,7 +35,9 @@ btshare invite                     # on a computer that's already set up: shows 
 
 The installer:
 
-1. builds and installs `~/.local/bin/btshare`;
+1. builds btshare and, after asking, installs it root-owned to `/usr/local/bin`,
+   which is on sudo's path, so `sudo btshare keys ...` works. If you decline, it installs
+   to `~/.local/bin` and you run `sudo ~/.local/bin/btshare keys ...` instead;
 2. creates `~/.config/btshare/config.toml` listing only this computer
    (hostname, LAN address, and a new secret, or the group's when joining);
 3. detects **ufw** or **firewalld**, shows the exact rule that allows the agent port
@@ -46,7 +48,12 @@ The installer:
    other member is told about the new one;
 6. on GNOME, offers the shortcut **Super+Alt+B** for `btshare -notify next`.
 
-Re-running it updates the binary and restarts the agent; your config is kept.
+**Updating:** re-run `./install.sh`. If the source is a git checkout, it shows
+new commits on the remote and offers to pull them (skipped when you have local
+changes), then rebuilds, reinstalls, restarts the agent and prints
+`Updated btshare <old> → <new>`. Your config, firewall rule and shortcut are
+kept, and you aren't asked again about steps you already answered.
+`btshare version` shows what's installed.
 Options: `--name`, `--port`, `--no-firewall`, `--no-hotkey`, `--yes`;
 `./install.sh --uninstall [--purge]` removes everything, including the firewall rule
 (after asking).
@@ -71,7 +78,7 @@ must therefore look like the same host to the device:
 
 ```sh
 # On the computer where the device is paired:
-sudo btshare keys export mouse -config ~/.config/btshare/config.toml -o mouse.bundle.json
+sudo btshare keys export mouse -o mouse.bundle.json   # file is owned by you, not root
 # Copy it securely (it contains secret keys), then on each other computer:
 sudo btshare keys import mouse.bundle.json -set-address
 shred -u mouse.bundle.json
