@@ -500,7 +500,8 @@ fi
 
 if [[ -n $JOIN ]]; then
 	step "Joining $JOIN"
-	"$BIN" join "$JOIN" || die "could not join $JOIN. Is its agent running, is its firewall open, and is the secret right?"
+	# The secret was set above, so join must not ask for it again.
+	"$BIN" join "$JOIN" </dev/null || die "could not join $JOIN. Is its agent running, is its firewall open, and is the secret right?"
 fi
 
 if ((HOTKEY)); then

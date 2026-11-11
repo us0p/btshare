@@ -180,6 +180,14 @@ func ValidMAC(s string) (string, error) {
 	return s, nil
 }
 
+// ValidSecret checks a group secret's format.
+func ValidSecret(s string) error {
+	if !secretRE.MatchString(s) {
+		return errors.New("secret must be 16+ characters (letters, digits, -_.~+/=)")
+	}
+	return nil
+}
+
 func ValidAddr(s string) error {
 	h, p, err := net.SplitHostPort(s)
 	if err != nil || h == "" || p == "" || strings.ContainsAny(s, "\"\\\n") {

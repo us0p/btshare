@@ -68,6 +68,17 @@ git clone https://github.com/us0p/btshare && cd btshare
 Both computers now list each other (`btshare status` shows both). If two
 computers have the same hostname, give one another name with `--name`.
 
+If btshare is already installed on the laptop (for example it was set up on
+its own, with its own secret), join without reinstalling:
+
+```sh
+btshare join 192.168.1.10      # asks for the secret; Enter keeps the laptop's current one
+```
+
+The secret is saved only if the other computer accepts it. "bad signature"
+means it doesn't match: copy it again from `btshare invite`. Run `--fresh` or
+`init` on one computer only; every other computer joins its group.
+
 ### 3. Pair the device with the first computer
 
 Pair it as usual (GNOME Settings → Bluetooth, or `bluetoothctl`). For a

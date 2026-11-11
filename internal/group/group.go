@@ -4,6 +4,7 @@ package group
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/us0p/btshare/internal/config"
@@ -27,10 +28,20 @@ func remote(cfg *config.Config, addr string) *node.Remote {
 // Join registers this host with the agent at peerAddr, appends the peer's
 // hosts and devices to the local config, then announces this host to every
 // other member so all configs list each other.
-func Join(ctx context.Context, cfgPath, peerAddr string) (*config.Config, []Warning, error) {
+//
+// secret is the group's secret; "" keeps this host's current one. It is
+// saved only once the peer has accepted it, so a mistyped secret changes
+// nothing.
+func Join(ctx context.Context, cfgPath, peerAddr, secret string) (*config.Config, []Warning, error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return nil, nil, err
+	}
+	if secret != "" {
+		if err := config.ValidSecret(secret); err != nil {
+			return nil, nil, err
+		}
+		cfg.Secret = secret
 	}
 	self, _ := cfg.Host(cfg.Self)
 	if self.Addr == peerAddr {
@@ -42,10 +53,14 @@ func Join(ctx context.Context, cfgPath, peerAddr string) (*config.Config, []Warn
 	resp, err := remote(cfg, peerAddr).Join(cctx, req)
 	cancel()
 	if err != nil {
+		if strings.Contains(err.Error(), "bad signature") {
+			err = fmt.Errorf("%w (the secret doesn't match that computer's; run `btshare invite` there to see it)", err)
+		}
 		return nil, nil, fmt.Errorf("join %s: %w", peerAddr, err)
 	}
 
 	cfg, err = config.Update(cfgPath, func(c *config.Config) error {
+		c.Secret = cfg.Secret
 		for _, h := range resp.Hosts {
 			if h.Name != c.Self {
 				c.UpsertHost(h)

@@ -29,7 +29,10 @@ type Notifier interface {
 }
 
 type Server struct {
-	Node       node.Node
+	Node node.Node
+	// Secret is used when the config can't be read; otherwise the config's
+	// current secret is, so `btshare join` or `reconfigure` changing it
+	// takes effect without restarting the agent.
 	Secret     []byte
 	ConfigPath string // re-read on every request so joins/device adds apply live
 	Notify     Notifier
@@ -62,7 +65,7 @@ func (s *Server) authed(h handler) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, node.ErrorResponse{Error: "read body: " + err.Error()})
 			return
 		}
-		if err := auth.Verify(r, s.Secret, body, time.Now()); err != nil {
+		if err := auth.Verify(r, s.secret(), body, time.Now()); err != nil {
 			s.logf("rejected %s from %s: %v", r.URL.Path, r.RemoteAddr, err)
 			s.notifyError("Rejected request from "+remoteIP(r),
 				fmt.Sprintf("%v. If this is one of your computers, its btshare secret or clock is wrong.", err))
@@ -71,6 +74,15 @@ func (s *Server) authed(h handler) http.HandlerFunc {
 		}
 		h(w, r, body)
 	}
+}
+
+func (s *Server) secret() []byte {
+	if s.ConfigPath != "" {
+		if c, err := config.Load(s.ConfigPath); err == nil {
+			return []byte(c.Secret)
+		}
+	}
+	return s.Secret
 }
 
 func (s *Server) loadConfig() (*config.Config, error) {

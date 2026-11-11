@@ -20,6 +20,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/us0p/btshare/internal/agent"
 	"github.com/us0p/btshare/internal/bluez"
@@ -38,7 +39,8 @@ const usage = `btshare - share a Bluetooth device between Linux hosts
 Setup (install.sh runs init/join for you):
   btshare init [-name N] [-addr IP:PORT] [-secret S]  create config for this host
   btshare reconfigure [-name N] [-port P] [-secret S]  change an existing config
-  btshare join <ip[:port]>            join the group of the computer at ip
+  btshare join <ip[:port]> [-secret S] join the group of the computer at ip;
+                                      asks for its secret (see invite)
   btshare invite                      print the command to add another computer
   btshare host add <name> <ip[:port]> append a host manually (no network)
   btshare device add <name> <MAC|paired name>  share a device with all hosts;
@@ -338,10 +340,29 @@ func withPort(addr string) string {
 }
 
 func runJoin(ctx context.Context, args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: btshare join <ip[:port]>")
+	fs := flag.NewFlagSet("join", flag.ContinueOnError)
+	secretFlag := fs.String("secret", "", "the group's secret (default: ask for it)")
+	var addr string
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		addr, args = args[0], args[1:]
 	}
-	cfg, warns, err := group.Join(ctx, *configPath, withPort(args[0]))
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if addr == "" && fs.NArg() == 1 {
+		addr = fs.Arg(0)
+	}
+	if addr == "" || fs.NArg() > 1 || (fs.NArg() == 1 && addr != fs.Arg(0)) {
+		return errors.New("usage: btshare join <ip[:port]> [-secret S]")
+	}
+	secret := *secretFlag
+	if secret == "" {
+		var err error
+		if secret, err = readSecret(addr); err != nil {
+			return err
+		}
+	}
+	cfg, warns, err := group.Join(ctx, *configPath, withPort(addr), secret)
 	if err != nil {
 		return err
 	}
@@ -355,14 +376,51 @@ func runJoin(ctx context.Context, args []string) error {
 	return nil
 }
 
+// isTerminal reports whether f is a terminal (not just any character
+// device such as /dev/null).
+func isTerminal(f *os.File) bool {
+	var t syscall.Termios
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TCGETS, uintptr(unsafe.Pointer(&t)))
+	return errno == 0
+}
+
+// readSecret asks for the group secret without echoing it. Enter keeps
+// this computer's current secret. Without a terminal it reads one line
+// from stdin (install.sh passes nothing: it has set the secret already).
+func readSecret(addr string) (string, error) {
+	if !isTerminal(os.Stdin) {
+		var line string
+		_, _ = fmt.Fscanln(os.Stdin, &line)
+		return strings.TrimSpace(line), nil
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	fmt.Fprintf(os.Stderr, "On %s, `btshare invite` shows the group secret.\nGroup secret (Enter keeps this computer's current one): ", host)
+	stty := func(arg string) {
+		c := exec.Command("stty", arg)
+		c.Stdin = os.Stdin
+		_ = c.Run()
+	}
+	stty("-echo")
+	var line string
+	_, _ = fmt.Fscanln(os.Stdin, &line)
+	stty("echo")
+	fmt.Fprintln(os.Stderr)
+	return strings.TrimSpace(line), nil
+}
+
 func runInvite() error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
 	}
 	self, _ := cfg.Host(cfg.Self)
-	fmt.Printf("On the other computer, from the btshare source directory, run:\n\n"+
-		"  ./install.sh --join %s\n\nand paste this secret when asked:\n\n  %s\n", self.Addr, cfg.Secret)
+	fmt.Printf("On the other computer, run (from the btshare source directory):\n\n"+
+		"  ./install.sh --join %s       if btshare isn't installed there yet\n"+
+		"  btshare join %s              if it is\n\nand paste this secret when asked:\n\n  %s\n",
+		self.Addr, self.Addr, cfg.Secret)
 	return nil
 }
 

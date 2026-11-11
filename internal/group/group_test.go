@@ -87,10 +87,10 @@ func TestJoinAndDevicePropagation(t *testing.T) {
 	if _, _, err := AddDevice(ctx, a.path, config.Device{Name: "mouse", MAC: "aa:bb:cc:dd:ee:7f"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, w, err := Join(ctx, b.path, a.addr); err != nil || len(w) > 0 {
+	if _, w, err := Join(ctx, b.path, a.addr, ""); err != nil || len(w) > 0 {
 		t.Fatalf("b join: %v %v", err, w)
 	}
-	if _, w, err := Join(ctx, c.path, b.addr); err != nil || len(w) > 0 {
+	if _, w, err := Join(ctx, c.path, b.addr, ""); err != nil || len(w) > 0 {
 		t.Fatalf("c join: %v %v", err, w)
 	}
 
@@ -121,7 +121,7 @@ func TestJoinAndDevicePropagation(t *testing.T) {
 func TestJoinRejectsNameClash(t *testing.T) {
 	a := newMember(t, "pc")
 	b := newMember(t, "pc")
-	if _, _, err := Join(context.Background(), b.path, a.addr); err == nil {
+	if _, _, err := Join(context.Background(), b.path, a.addr, ""); err == nil {
 		t.Fatal("expected name clash error")
 	}
 	if len(a.note.errors) == 0 {
@@ -159,7 +159,7 @@ func TestAgentNotifiesErrors(t *testing.T) {
 func TestDeviceRemovePropagation(t *testing.T) {
 	ctx := context.Background()
 	a, b := newMember(t, "a"), newMember(t, "b")
-	if _, w, err := Join(ctx, b.path, a.addr); err != nil || len(w) > 0 {
+	if _, w, err := Join(ctx, b.path, a.addr, ""); err != nil || len(w) > 0 {
 		t.Fatalf("join: %v %v", err, w)
 	}
 	for _, d := range []config.Device{{Name: "mouse", MAC: "AA:BB:CC:DD:EE:80"}, {Name: "kbd", MAC: "11:22:33:44:55:66"}} {
@@ -198,7 +198,7 @@ func TestDeviceRemovePropagation(t *testing.T) {
 func TestMultiChannelDeviceRegistration(t *testing.T) {
 	ctx := context.Background()
 	a, b := newMember(t, "a"), newMember(t, "b")
-	if _, w, err := Join(ctx, b.path, a.addr); err != nil || len(w) > 0 {
+	if _, w, err := Join(ctx, b.path, a.addr, ""); err != nil || len(w) > 0 {
 		t.Fatalf("join: %v %v", err, w)
 	}
 	// a: channel 1 at :83. b: channel 2, where the mouse uses :7F.
@@ -241,5 +241,29 @@ func TestMultiChannelDeviceRegistration(t *testing.T) {
 	}
 	if cfg, _ := config.Load(a.path); len(cfg.Devices) != 0 {
 		t.Errorf("a still has %+v", cfg.Devices)
+	}
+}
+
+func TestJoinWithSecret(t *testing.T) {
+	ctx := context.Background()
+	a, b := newMember(t, "a"), newMember(t, "b")
+	// b was installed on its own, with a different secret.
+	if _, err := config.Update(b.path, func(c *config.Config) error { c.Secret = "another-secret-0123456789"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Join(ctx, b.path, a.addr, ""); err == nil || !strings.Contains(err.Error(), "btshare invite") {
+		t.Fatalf("join with b's own secret: %v", err)
+	}
+	if _, _, err := Join(ctx, b.path, a.addr, "mistyped-secret-0123456789"); err == nil {
+		t.Fatal("wrong secret accepted")
+	}
+	if c, _ := config.Load(b.path); c.Secret != "another-secret-0123456789" {
+		t.Fatal("a rejected secret was saved")
+	}
+	if _, w, err := Join(ctx, b.path, a.addr, secret); err != nil || len(w) > 0 {
+		t.Fatalf("join: %v %v", err, w)
+	}
+	if c, _ := config.Load(b.path); c.Secret != secret || len(c.Hosts) != 2 {
+		t.Fatalf("after join: %d hosts, secret saved=%v", len(c.Hosts), c.Secret == secret)
 	}
 }
