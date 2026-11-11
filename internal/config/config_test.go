@@ -141,3 +141,41 @@ func TestSetPort(t *testing.T) {
 		t.Fatalf("after set port: %+v", c)
 	}
 }
+
+func TestMultiChannelDeviceRoundTrip(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.toml")
+	c := base()
+	c.Hosts = append(c.Hosts, Host{Name: "laptop", Addr: "10.0.0.2:7531"})
+	c.Devices = []Device{
+		{Name: "kbd", MAC: "11:22:33:44:55:66"},
+		{Name: "mx", MAC: "AA:BB:CC:DD:EE:83", Hosts: []DeviceHost{
+			{Host: "desktop", MAC: "aa:bb:cc:dd:ee:83", Channel: 1},
+			{Host: "laptop", MAC: "AA:BB:CC:DD:EE:7F", Channel: 2},
+		}},
+	}
+	if err := Create(p, c); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mx, _ := got.Device("AA:BB:CC:DD:EE:7F")
+	if mx.Name != "mx" || !mx.MultiChannel() || mx.MACOn("desktop") != "AA:BB:CC:DD:EE:83" || mx.MACOn("laptop") != "AA:BB:CC:DD:EE:7F" {
+		t.Fatalf("mx = %+v", mx)
+	}
+	if kbd, _ := got.Device("kbd"); kbd.MultiChannel() || kbd.MACOn("laptop") != "11:22:33:44:55:66" {
+		t.Fatalf("kbd = %+v", kbd)
+	}
+	// Renaming this computer follows into its channel entry.
+	if _, err := got.RenameSelf("pc"); err != nil {
+		t.Fatal(err)
+	}
+	if mx, _ := got.Device("mx"); mx.MACOn("pc") != "AA:BB:CC:DD:EE:83" {
+		t.Fatalf("after rename: %+v", mx)
+	}
+	// Two computers can't share a channel.
+	if _, err := mx.SetHost(DeviceHost{Host: "pc3", MAC: "AA:BB:CC:DD:EE:81", Channel: 2}); err == nil {
+		t.Fatal("duplicate channel accepted")
+	}
+}

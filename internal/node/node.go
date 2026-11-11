@@ -15,17 +15,22 @@ import (
 	"github.com/us0p/btshare/internal/auth"
 	"github.com/us0p/btshare/internal/bluez"
 	"github.com/us0p/btshare/internal/config"
+	"github.com/us0p/btshare/internal/hidpp"
 )
 
 type Node interface {
 	State(ctx context.Context, mac string) (bluez.DeviceState, error)
 	Release(ctx context.Context, mac string) (bluez.DeviceState, error)
 	Acquire(ctx context.Context, mac string) (bluez.DeviceState, error)
+	// SetChannel tells a multi-channel device connected to this host to
+	// switch to channel (1-based), handing it to the computer on that channel.
+	SetChannel(ctx context.Context, mac string, channel int) error
 }
 
 // Request is the JSON body for every agent endpoint.
 type Request struct {
-	MAC string `json:"mac"`
+	MAC     string `json:"mac"`
+	Channel int    `json:"channel,omitempty"` // for /v1/channel
 }
 
 // Response is the JSON body every agent endpoint returns.
@@ -96,6 +101,19 @@ func (l *Local) Acquire(ctx context.Context, mac string) (bluez.DeviceState, err
 	return l.bz.Acquire(ctx, mac)
 }
 
+func (l *Local) SetChannel(_ context.Context, mac string, channel int) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.bz.Logf != nil {
+		l.bz.Logf("channel %s: switching it to channel %d", mac, channel)
+	}
+	err := hidpp.SetChannel(mac, channel)
+	if err != nil && l.bz.Logf != nil {
+		l.bz.Logf("channel %s: %v", mac, err)
+	}
+	return err
+}
+
 // ---- remote ----
 
 type Remote struct {
@@ -163,6 +181,10 @@ func (r *Remote) AddDevice(ctx context.Context, d config.Device) error {
 // RemoveDevice asks the peer to drop the device (matched by MAC) from its config.
 func (r *Remote) RemoveDevice(ctx context.Context, d config.Device) error {
 	return r.post(ctx, "/v1/device/remove", DeviceRequest{Device: d}, nil)
+}
+
+func (r *Remote) SetChannel(ctx context.Context, mac string, channel int) error {
+	return r.post(ctx, "/v1/channel", Request{MAC: mac, Channel: channel}, nil)
 }
 
 func (r *Remote) State(ctx context.Context, mac string) (bluez.DeviceState, error) {

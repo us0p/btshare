@@ -45,6 +45,7 @@ func (s *Server) Handler() http.Handler {
 		defer cancel()
 		return s.Node.Acquire(ctx, mac)
 	})))
+	mux.HandleFunc("POST /v1/channel", s.authed(s.setChannel))
 	mux.HandleFunc("POST /v1/join", s.authed(s.join))
 	mux.HandleFunc("POST /v1/device", s.authed(s.addDevice))
 	mux.HandleFunc("POST /v1/device/remove", s.authed(s.removeDevice))
@@ -111,6 +112,34 @@ func (s *Server) deviceOp(verb string, op func(context.Context, string) (bluez.D
 			r.URL.Path, dev.Name, r.RemoteAddr, st.Connected, st.Blocked, err)
 		writeJSON(w, code, resp)
 	}
+}
+
+// setChannel switches a multi-channel device connected here to another
+// computer's channel.
+func (s *Server) setChannel(w http.ResponseWriter, r *http.Request, body []byte) {
+	var req node.Request
+	if err := json.Unmarshal(body, &req); err != nil || req.MAC == "" || req.Channel < 1 {
+		writeJSON(w, http.StatusBadRequest, node.ErrorResponse{Error: `body must be {"mac": ..., "channel": N}`})
+		return
+	}
+	cfg, err := s.loadConfig()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, node.ErrorResponse{Error: err.Error()})
+		return
+	}
+	dev, err := cfg.Device(req.MAC)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, node.ErrorResponse{Error: "device " + req.MAC + " is not in " + cfg.Self + "'s config"})
+		return
+	}
+	err = s.Node.SetChannel(r.Context(), req.MAC, req.Channel)
+	s.logf("%s %s channel %d from %s -> err=%v", r.URL.Path, dev.Name, req.Channel, r.RemoteAddr, err)
+	if err != nil {
+		s.notifyError(fmt.Sprintf("Could not switch %s to channel %d", dev.Name, req.Channel), err.Error())
+		writeJSON(w, http.StatusConflict, node.ErrorResponse{Error: err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, node.ErrorResponse{})
 }
 
 func (s *Server) join(w http.ResponseWriter, r *http.Request, body []byte) {

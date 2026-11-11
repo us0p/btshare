@@ -29,6 +29,77 @@ type Host struct {
 type Device struct {
 	Name string `toml:"name" json:"name"`
 	MAC  string `toml:"mac" json:"mac"`
+	// Hosts is set for multi-channel devices (e.g. Logitech Easy-Switch):
+	// each computer is paired on its own channel, where the device may use
+	// a different address. Empty for single-host devices, which every
+	// computer reaches at MAC with copied pairing keys.
+	Hosts []DeviceHost `toml:"hosts,omitempty" json:"hosts,omitempty"`
+}
+
+// DeviceHost is where one computer finds a multi-channel device.
+type DeviceHost struct {
+	Host    string `toml:"host" json:"host"`
+	MAC     string `toml:"mac" json:"mac"`         // the device's address on that channel
+	Channel int    `toml:"channel" json:"channel"` // 1-based, as printed on the device
+}
+
+// MultiChannel reports whether the device switches by changing its channel.
+func (d Device) MultiChannel() bool { return len(d.Hosts) > 0 }
+
+// On returns host's entry for a multi-channel device.
+func (d Device) On(host string) (DeviceHost, bool) {
+	for _, h := range d.Hosts {
+		if h.Host == host {
+			return h, true
+		}
+	}
+	return DeviceHost{}, false
+}
+
+// MACOn returns the address host uses for the device.
+func (d Device) MACOn(host string) string {
+	if h, ok := d.On(host); ok {
+		return h.MAC
+	}
+	return d.MAC
+}
+
+// HasAddr reports whether mac is one of the device's addresses.
+func (d Device) HasAddr(mac string) bool {
+	if strings.EqualFold(d.MAC, mac) {
+		return true
+	}
+	for _, h := range d.Hosts {
+		if strings.EqualFold(h.MAC, mac) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetHost adds or replaces host's entry. It refuses a channel another
+// computer already uses: the device can't tell those two apart.
+func (d *Device) SetHost(e DeviceHost) (bool, error) {
+	e.MAC = strings.ToUpper(e.MAC)
+	if e.Channel < 1 || e.Channel > 255 {
+		return false, fmt.Errorf("invalid channel %d", e.Channel)
+	}
+	for _, h := range d.Hosts {
+		if h.Host != e.Host && h.Channel == e.Channel {
+			return false, fmt.Errorf("%s already uses channel %d of %s; pair it with this computer on another channel", h.Host, h.Channel, d.Name)
+		}
+	}
+	for i, h := range d.Hosts {
+		if h.Host == e.Host {
+			if h == e {
+				return false, nil
+			}
+			d.Hosts[i] = e
+			return true, nil
+		}
+	}
+	d.Hosts = append(d.Hosts, e)
+	return true, nil
 }
 
 type Config struct {
@@ -88,6 +159,9 @@ func (c *Config) defaults() {
 	}
 	for i := range c.Devices {
 		c.Devices[i].MAC = strings.ToUpper(c.Devices[i].MAC)
+		for j := range c.Devices[i].Hosts {
+			c.Devices[i].Hosts[j].MAC = strings.ToUpper(c.Devices[i].Hosts[j].MAC)
+		}
 	}
 }
 
@@ -155,6 +229,22 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("config: duplicate device %q", d.Name)
 		}
 		seen[d.Name] = true
+		hosts, channels := map[string]bool{}, map[int]bool{}
+		for _, h := range d.Hosts {
+			if err := ValidName(h.Host); err != nil {
+				return fmt.Errorf("config: device %s: host: %w", d.Name, err)
+			}
+			if _, err := ValidMAC(h.MAC); err != nil {
+				return fmt.Errorf("config: device %s on %s: %w", d.Name, h.Host, err)
+			}
+			if h.Channel < 1 || h.Channel > 255 {
+				return fmt.Errorf("config: device %s on %s: invalid channel %d", d.Name, h.Host, h.Channel)
+			}
+			if hosts[h.Host] || channels[h.Channel] {
+				return fmt.Errorf("config: device %s: host %s or channel %d listed twice", d.Name, h.Host, h.Channel)
+			}
+			hosts[h.Host], channels[h.Channel] = true, true
+		}
 	}
 	return nil
 }
@@ -168,10 +258,10 @@ func (c *Config) Host(name string) (Host, error) {
 	return Host{}, fmt.Errorf("unknown host %q", name)
 }
 
-// Device resolves a device by configured name or MAC.
+// Device resolves a device by configured name or any of its addresses.
 func (c *Config) Device(nameOrMAC string) (Device, error) {
 	for _, d := range c.Devices {
-		if strings.EqualFold(d.Name, nameOrMAC) || strings.EqualFold(d.MAC, nameOrMAC) {
+		if strings.EqualFold(d.Name, nameOrMAC) || d.HasAddr(nameOrMAC) {
 			return d, nil
 		}
 	}
@@ -201,28 +291,48 @@ func (c *Config) UpsertHost(h Host) bool {
 	return true
 }
 
-// UpsertDevice appends d, or updates the MAC of an existing device with the
-// same name. Reports whether anything changed.
+// UpsertDevice appends d, or merges it into the existing device with the
+// same name: its MAC is updated and its per-computer channels are added to
+// (or replace) the existing ones, so computers can register their own
+// channel without knowing the others'. Reports whether anything changed.
 func (c *Config) UpsertDevice(d Device) bool {
 	d.MAC = strings.ToUpper(d.MAC)
+	for i := range d.Hosts {
+		d.Hosts[i].MAC = strings.ToUpper(d.Hosts[i].MAC)
+	}
 	for i, e := range c.Devices {
-		if e.Name == d.Name {
-			if e.MAC == d.MAC {
-				return false
-			}
-			c.Devices[i].MAC = d.MAC
-			return true
+		if e.Name != d.Name {
+			continue
 		}
+		changed := e.MAC != d.MAC
+		c.Devices[i].MAC = d.MAC
+		for _, h := range d.Hosts {
+			// Another computer's stale claim on the same channel gives way
+			// to the newer one: the device was re-paired there.
+			kept := c.Devices[i].Hosts[:0]
+			for _, o := range c.Devices[i].Hosts {
+				if o.Host == h.Host || o.Channel != h.Channel {
+					kept = append(kept, o)
+				} else {
+					changed = true
+				}
+			}
+			c.Devices[i].Hosts = kept
+			if ch, _ := c.Devices[i].SetHost(h); ch {
+				changed = true
+			}
+		}
+		return changed
 	}
 	c.Devices = append(c.Devices, d)
 	return true
 }
 
-// RemoveDevice removes the device with this MAC. Reports whether it was there.
+// RemoveDevice removes the device with this address (any of its
+// addresses). Reports whether it was there.
 func (c *Config) RemoveDevice(mac string) bool {
-	mac = strings.ToUpper(mac)
 	for i, d := range c.Devices {
-		if d.MAC == mac {
+		if d.HasAddr(mac) {
 			c.Devices = append(c.Devices[:i], c.Devices[i+1:]...)
 			return true
 		}
@@ -245,6 +355,13 @@ func (c *Config) RenameSelf(name string) (bool, error) {
 	for i := range c.Hosts {
 		if c.Hosts[i].Name == c.Self {
 			c.Hosts[i].Name = name
+		}
+	}
+	for i := range c.Devices {
+		for j := range c.Devices[i].Hosts {
+			if c.Devices[i].Hosts[j].Host == c.Self {
+				c.Devices[i].Hosts[j].Host = name
+			}
 		}
 	}
 	c.Self = name
@@ -341,6 +458,12 @@ func Render(c *Config) []byte {
 	}
 	for _, d := range c.Devices {
 		fmt.Fprintf(&b, "\n[[devices]]\nname = %q\nmac = %q\n", d.Name, d.MAC)
+		if d.MultiChannel() {
+			b.WriteString("# Multi-channel device: each computer is paired on its own channel.\n")
+		}
+		for _, h := range d.Hosts {
+			fmt.Fprintf(&b, "\n[[devices.hosts]]\nhost = %q\nmac = %q\nchannel = %d\n", h.Host, h.MAC, h.Channel)
+		}
 	}
 	return b.Bytes()
 }

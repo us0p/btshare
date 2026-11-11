@@ -25,6 +25,7 @@ import (
 	"github.com/us0p/btshare/internal/bluez"
 	"github.com/us0p/btshare/internal/config"
 	"github.com/us0p/btshare/internal/group"
+	"github.com/us0p/btshare/internal/hidpp"
 	"github.com/us0p/btshare/internal/keys"
 	"github.com/us0p/btshare/internal/netinfo"
 	"github.com/us0p/btshare/internal/node"
@@ -40,7 +41,9 @@ Setup (install.sh runs init/join for you):
   btshare join <ip[:port]>            join the group of the computer at ip
   btshare invite                      print the command to add another computer
   btshare host add <name> <ip[:port]> append a host manually (no network)
-  btshare device add <name> <MAC|paired name>  share a device with all hosts
+  btshare device add <name> <MAC|paired name>  share a device with all hosts;
+                                      run it on every computer for a device
+                                      with channels (Logitech Easy-Switch)
   btshare device remove <name|MAC>    stop sharing a device, on all hosts
   btshare device list                 devices paired with this computer
 
@@ -398,7 +401,11 @@ func runDevice(ctx context.Context, args []string) error {
 			if d, err := cfg.Device(p.MAC); err == nil {
 				shared = "shared as " + d.Name
 			}
-			fmt.Printf("%s  %-28s %s\n", p.MAC, p.Name, shared)
+			conn := ""
+			if p.Connected {
+				conn = "connected"
+			}
+			fmt.Printf("%s  %-28s %-10s %s\n", p.MAC, p.Name, conn, shared)
 		}
 		return nil
 	case "add":
@@ -409,15 +416,47 @@ func runDevice(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		warns, err := group.AddDevice(ctx, *configPath, config.Device{Name: args[1], MAC: mac})
+		// Find out how this device can be shared: by switching its channel
+		// if it has several, by moving its single pairing otherwise.
+		var here *config.DeviceHost
+		info, perr := hidpp.Probe(mac)
+		switch {
+		case perr == nil:
+			here = &config.DeviceHost{Host: cfg.Self, MAC: mac, Channel: info.Current}
+		case errors.Is(perr, hidpp.ErrNotFound):
+			return fmt.Errorf("%s (%s) is not connected to this computer; connect it first, "+
+				"so btshare can check whether it has switchable channels", args[1], mac)
+		case !errors.Is(perr, hidpp.ErrNotSupported):
+			return fmt.Errorf("check %s for switchable channels: %w", args[1], perr)
+		}
+		d, warns, err := group.AddDevice(ctx, *configPath, config.Device{Name: args[1], MAC: mac}, here)
 		if err != nil {
 			return err
 		}
 		for _, w := range warns {
-			fmt.Fprintf(os.Stderr, "warning: not added on %v (re-run when it's online)\n", w)
+			fmt.Fprintf(os.Stderr, "warning: not updated on %v (re-run when it's online)\n", w)
 		}
-		fmt.Printf("sharing %s (%s) with %d computer(s)\n", args[1], mac, len(cfg.Hosts))
-		fmt.Printf("next: copy its pairing to the other computers (see `btshare keys` in the README)\n")
+		if here == nil {
+			fmt.Printf("sharing %s (%s) with %d computer(s): single-host device, one pairing for all computers\n",
+				d.Name, mac, len(cfg.Hosts))
+			fmt.Printf("next: copy its pairing to the other computers (README, step 4b)\n")
+			return nil
+		}
+		fmt.Printf("sharing %s with %d computer(s): it has %d channels, this computer (%s) is on channel %d\n",
+			d.Name, len(cfg.Hosts), info.Channels, cfg.Self, info.Current)
+		var missing []string
+		for _, h := range cfg.Hosts {
+			if e, ok := d.On(h.Name); ok {
+				fmt.Printf("  channel %d  %-14s %s\n", e.Channel, h.Name, e.MAC)
+			} else {
+				fmt.Printf("  -          %-14s not set up yet\n", h.Name)
+				missing = append(missing, h.Name)
+			}
+		}
+		if len(missing) > 0 {
+			fmt.Printf("next, on %s: select another channel on %s, pair it there, then run\n  btshare device add %s <MAC|paired name>\n",
+				strings.Join(missing, ", "), d.Name, d.Name)
+		}
 		return nil
 	case "remove", "rm":
 		if len(args) != 2 {
@@ -455,19 +494,34 @@ func resolveMAC(cfg *config.Config, arg string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var hits []bluez.PairedDevice
+	// Exact name matches first, then partial ones. Several devices can share
+	// a name (e.g. an old pairing next to a new one): the connected one wins.
+	var exact, partial []bluez.PairedDevice
 	for _, p := range paired {
 		if strings.EqualFold(p.Name, arg) {
-			return p.MAC, nil
-		}
-		if strings.Contains(strings.ToLower(p.Name), strings.ToLower(arg)) {
-			hits = append(hits, p)
+			exact = append(exact, p)
+		} else if strings.Contains(strings.ToLower(p.Name), strings.ToLower(arg)) {
+			partial = append(partial, p)
 		}
 	}
-	if len(hits) == 1 {
-		return hits[0].MAC, nil
+	for _, hits := range [][]bluez.PairedDevice{exact, partial} {
+		if len(hits) == 1 {
+			return hits[0].MAC, nil
+		}
+		var connected []bluez.PairedDevice
+		for _, h := range hits {
+			if h.Connected {
+				connected = append(connected, h)
+			}
+		}
+		if len(connected) == 1 {
+			return connected[0].MAC, nil
+		}
+		if len(hits) > 1 {
+			return "", fmt.Errorf("%q matches %d paired devices; pass the MAC (see `btshare device list`)", arg, len(hits))
+		}
 	}
-	return "", fmt.Errorf("%q matches %d paired devices; pass the MAC (see `btshare device list`)", arg, len(hits))
+	return "", fmt.Errorf("no paired device named %q (see `btshare device list`)", arg)
 }
 
 func genSecret() string {
@@ -490,13 +544,25 @@ func runStatus(ctx context.Context, args []string) error {
 		devs = []config.Device{d}
 	}
 	for _, d := range devs {
-		fmt.Printf("%s (%s)\n", d.Name, d.MAC)
-		for _, r := range s.Status(ctx, d.MAC) {
+		if d.MultiChannel() {
+			fmt.Printf("%s (switches channels)\n", d.Name)
+		} else {
+			fmt.Printf("%s (%s)\n", d.Name, d.MAC)
+		}
+		for _, r := range s.Status(ctx, d) {
 			marker := " "
 			if r.Host == cfg.Self {
 				marker = "*"
 			}
-			fmt.Printf("  %s %-12s %s\n", marker, r.Host, describe(r))
+			state := describe(r)
+			if d.MultiChannel() {
+				if e, ok := d.On(r.Host); ok {
+					state = fmt.Sprintf("channel %d  %s", e.Channel, state)
+				} else {
+					state = "not set up (run `btshare device add " + d.Name + " ...` there)"
+				}
+			}
+			fmt.Printf("  %s %-12s %s\n", marker, r.Host, state)
 		}
 	}
 	return nil
@@ -513,7 +579,7 @@ func describe(r switcher.HostResult) string {
 	case r.State.Blocked:
 		return "released"
 	default:
-		return "idle"
+		return "not connected"
 	}
 }
 
@@ -541,11 +607,11 @@ func runSwitch(ctx context.Context, device, target string) error {
 		var err error
 		switch target {
 		case "@next":
-			rep, err = s.Next(ctx, d.MAC)
+			rep, err = s.Next(ctx, d)
 		case "@here":
-			rep, err = s.Switch(ctx, d.MAC, cfg.Self)
+			rep, err = s.Switch(ctx, d, cfg.Self)
 		default:
-			rep, err = s.Switch(ctx, d.MAC, target)
+			rep, err = s.Switch(ctx, d, target)
 		}
 		if rep != nil {
 			for _, r := range rep.Released {

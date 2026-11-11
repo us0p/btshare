@@ -1,0 +1,6 @@
+# btshare: let the logged-in user read and switch the channels of Logitech
+# Bluetooth devices (HID++ over /dev/hidraw). Without it only root can, and
+# btshare can't detect or switch multi-channel devices (Easy-Switch).
+# Bluetooth (bus 0005), Logitech (vendor 046D) only. The number must stay
+# below 73 so systemd's uaccess handling sees the tag.
+SUBSYSTEM=="hidraw", KERNELS=="0005:046D:*", TAG+="uaccess"

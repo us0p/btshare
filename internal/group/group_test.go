@@ -41,6 +41,7 @@ func (failingNode) Release(context.Context, string) (bluez.DeviceState, error) {
 func (failingNode) Acquire(context.Context, string) (bluez.DeviceState, error) {
 	return bluez.DeviceState{}, errors.New("page timeout")
 }
+func (failingNode) SetChannel(context.Context, string, int) error { return nil }
 
 type member struct {
 	name string
@@ -83,7 +84,7 @@ func TestJoinAndDevicePropagation(t *testing.T) {
 	ctx := context.Background()
 	a, b, c := newMember(t, "a"), newMember(t, "b"), newMember(t, "c")
 
-	if _, err := AddDevice(ctx, a.path, config.Device{Name: "mouse", MAC: "aa:bb:cc:dd:ee:7f"}); err != nil {
+	if _, _, err := AddDevice(ctx, a.path, config.Device{Name: "mouse", MAC: "aa:bb:cc:dd:ee:7f"}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, w, err := Join(ctx, b.path, a.addr); err != nil || len(w) > 0 {
@@ -104,7 +105,7 @@ func TestJoinAndDevicePropagation(t *testing.T) {
 		t.Error("device not propagated to c")
 	}
 	// a device added on c reaches everyone.
-	if w, err := AddDevice(ctx, c.path, config.Device{Name: "keyboard", MAC: "11:22:33:44:55:66"}); err != nil || len(w) > 0 {
+	if _, w, err := AddDevice(ctx, c.path, config.Device{Name: "keyboard", MAC: "11:22:33:44:55:66"}, nil); err != nil || len(w) > 0 {
 		t.Fatalf("add device: %v %v", err, w)
 	}
 	for _, m := range []*member{a, b} {
@@ -131,7 +132,7 @@ func TestJoinRejectsNameClash(t *testing.T) {
 func TestAgentNotifiesErrors(t *testing.T) {
 	a := newMember(t, "a")
 	ctx := context.Background()
-	if _, err := AddDevice(ctx, a.path, config.Device{Name: "mouse", MAC: "AA:BB:CC:DD:EE:7F"}); err != nil {
+	if _, _, err := AddDevice(ctx, a.path, config.Device{Name: "mouse", MAC: "AA:BB:CC:DD:EE:7F"}, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -162,7 +163,7 @@ func TestDeviceRemovePropagation(t *testing.T) {
 		t.Fatalf("join: %v %v", err, w)
 	}
 	for _, d := range []config.Device{{Name: "mouse", MAC: "AA:BB:CC:DD:EE:80"}, {Name: "kbd", MAC: "11:22:33:44:55:66"}} {
-		if w, err := AddDevice(ctx, a.path, d); err != nil || len(w) > 0 {
+		if _, w, err := AddDevice(ctx, a.path, d, nil); err != nil || len(w) > 0 {
 			t.Fatalf("add: %v %v", err, w)
 		}
 	}
@@ -191,5 +192,54 @@ func TestDeviceRemovePropagation(t *testing.T) {
 	}
 	if cfg, _ := config.Load(a.path); cfg.HasMAC("11:22:33:44:55:66") {
 		t.Error("peer-only device not removed from a")
+	}
+}
+
+func TestMultiChannelDeviceRegistration(t *testing.T) {
+	ctx := context.Background()
+	a, b := newMember(t, "a"), newMember(t, "b")
+	if _, w, err := Join(ctx, b.path, a.addr); err != nil || len(w) > 0 {
+		t.Fatalf("join: %v %v", err, w)
+	}
+	// a: channel 1 at :83. b: channel 2, where the mouse uses :7F.
+	ha := &config.DeviceHost{Host: "a", MAC: "AA:BB:CC:DD:EE:83", Channel: 1}
+	if _, w, err := AddDevice(ctx, a.path, config.Device{Name: "mx", MAC: ha.MAC}, ha); err != nil || len(w) > 0 {
+		t.Fatalf("add on a: %v %v", err, w)
+	}
+	// b without reading the channel: refused, it would lose the channel setup.
+	if _, _, err := AddDevice(ctx, b.path, config.Device{Name: "mx", MAC: "AA:BB:CC:DD:EE:7F"}, nil); err == nil {
+		t.Fatal("adding a multi-channel device without its channel succeeded")
+	}
+	// b on a's channel: refused.
+	same := &config.DeviceHost{Host: "b", MAC: "AA:BB:CC:DD:EE:7F", Channel: 1}
+	if _, _, err := AddDevice(ctx, b.path, config.Device{Name: "mx", MAC: same.MAC}, same); err == nil {
+		t.Fatal("two computers on one channel accepted")
+	}
+	hb := &config.DeviceHost{Host: "b", MAC: "AA:BB:CC:DD:EE:7F", Channel: 2}
+	if _, w, err := AddDevice(ctx, b.path, config.Device{Name: "mx", MAC: hb.MAC}, hb); err != nil || len(w) > 0 {
+		t.Fatalf("add on b: %v %v", err, w)
+	}
+	for _, m := range []*member{a, b} {
+		cfg, err := config.Load(m.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := cfg.Device("mx")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.MAC != ha.MAC || d.MACOn("a") != ha.MAC || d.MACOn("b") != hb.MAC || len(d.Hosts) != 2 {
+			t.Errorf("%s: %+v", m.name, d)
+		}
+		if !cfg.HasMAC(hb.MAC) {
+			t.Errorf("%s: agent would refuse b's address", m.name)
+		}
+	}
+	// Removing by b's address removes it everywhere.
+	if _, w, err := RemoveDevice(ctx, b.path, hb.MAC); err != nil || len(w) > 0 {
+		t.Fatalf("remove: %v %v", err, w)
+	}
+	if cfg, _ := config.Load(a.path); len(cfg.Devices) != 0 {
+		t.Errorf("a still has %+v", cfg.Devices)
 	}
 }

@@ -21,6 +21,7 @@ CONFIG="${BTSHARE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/btshare/config.toml}
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/btshare/install.state"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT="btshare-agent.service"
+UDEV_RULE="/etc/udev/rules.d/70-btshare-hidraw.rules"
 HOTKEY_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/btshare/"
 MK="org.gnome.settings-daemon.plugins.media-keys"
 
@@ -161,6 +162,39 @@ configure_firewall() {
 		if [[ $action == open ]]; then state_set firewall "$rule"; else state_set firewall ""; fi
 	else
 		warn "skipped; run the command(s) above yourself, or other computers can't reach this one"
+	fi
+}
+
+# -------------------------------------------------------------------- udev
+
+UDEV_RELOAD="sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw --action=change"
+
+# Multi-channel devices (Logitech Easy-Switch) are detected and switched
+# through /dev/hidraw, which is root-only by default.
+configure_udev() {
+	local src="$SRC/contrib/70-btshare-hidraw.rules"
+	if [[ -f $UDEV_RULE ]] && cmp -s "$src" "$UDEV_RULE"; then
+		echo "Already installed: $UDEV_RULE"
+		return
+	fi
+	if [[ $(state_get udev) == declined ]]; then
+		echo "Skipped (declined earlier). Multi-channel devices can't be switched without it; to install:"
+		echo "    sudo install -m 0644 $src $UDEV_RULE && $UDEV_RELOAD"
+		return
+	fi
+	echo "Devices with several channels (e.g. Logitech Easy-Switch mice and keyboards) are"
+	echo "switched by sending them a command through /dev/hidraw, which only root can use."
+	echo "This udev rule gives the logged-in user access to Logitech Bluetooth devices only."
+	echo "This will run:"
+	echo "    sudo install -m 0644 $src $UDEV_RULE"
+	echo "    $UDEV_RELOAD"
+	if confirm "Run with sudo now?"; then
+		sudo install -m 0644 "$src" "$UDEV_RULE"
+		eval "$UDEV_RELOAD"
+		state_set udev installed
+	else
+		state_set udev declined
+		warn "skipped; single-host devices still work, multi-channel ones can't be detected or switched"
 	fi
 }
 
@@ -319,6 +353,11 @@ if ((UNINSTALL)); then
 		step "Firewall"
 		configure_firewall close "$PORT"
 	fi
+	if [[ -f $UDEV_RULE ]]; then
+		step "Removing udev rule"
+		echo "This will run: sudo rm -f $UDEV_RULE"
+		if confirm "Remove it?"; then sudo rm -f "$UDEV_RULE"; else warn "kept $UDEV_RULE"; fi
+	fi
 	step "Removing binaries"
 	rm -f "$USER_BIN"
 	if [[ -e $SYS_BIN ]]; then
@@ -435,6 +474,9 @@ if ((FIREWALL)); then
 	configure_firewall open "$PORT"
 fi
 
+step "Device access"
+configure_udev
+
 step "Starting the agent"
 install -Dm644 "$SRC/contrib/$UNIT" "$UNIT_DIR/$UNIT"
 sed -i "s|^ExecStart=.*|ExecStart=$BIN agent|" "$UNIT_DIR/$UNIT"
@@ -470,9 +512,9 @@ step "Done"
 "$BIN" status 2>/dev/null || true
 cat <<EOF
 
-Next steps:
+Next steps (details: "Share a device" in $SRC/README.md):
+  • Add another computer:  btshare invite   (shows the command to run there)
   • Share a device:        btshare device add mouse "MX Vertical"   (btshare device list shows paired devices)
-  • Copy its pairing:      sudo btshare keys export mouse -o mouse.bundle.json   (see README)
-  • Add another computer:  btshare invite
+                           It tells you whether the device switches channels or needs its pairing copied.
   • Update later:          re-run $SRC/install.sh
 EOF

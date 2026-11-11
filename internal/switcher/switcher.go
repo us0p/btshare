@@ -1,4 +1,11 @@
-// Package switcher moves a device between hosts. The target starts
+// Package switcher moves a device between hosts, in one of two ways.
+//
+// Multi-channel devices (config.Device.MultiChannel) are paired with each
+// computer on their own channel. The target starts listening, then the
+// computer holding the device tells it to change to the target's channel,
+// like pressing its channel button. Nothing is released or blocked.
+//
+// Single-host devices have one pairing that every computer shares. The target starts
 // acquiring first (unblocked and waiting for the device), then every other
 // host releases it: a BLE device sends only a short burst of reconnection
 // advertising right after a disconnect, so the target must already be
@@ -16,6 +23,7 @@ import (
 	"time"
 
 	"github.com/us0p/btshare/internal/bluez"
+	"github.com/us0p/btshare/internal/config"
 	"github.com/us0p/btshare/internal/node"
 )
 
@@ -70,8 +78,16 @@ type Report struct {
 	Restored *HostResult
 }
 
-func (s *Switcher) forEach(ctx context.Context, timeout time.Duration, hosts []string,
-	op func(context.Context, node.Node) (bluez.DeviceState, error)) []HostResult {
+// Status queries every host for the device's state, each at the address
+// it uses for the device.
+func (s *Switcher) Status(ctx context.Context, d config.Device) []HostResult {
+	return s.forEachHost(ctx, QueryTimeout, s.Order, func(c context.Context, h string, n node.Node) (bluez.DeviceState, error) {
+		return n.State(c, d.MACOn(h))
+	})
+}
+
+func (s *Switcher) forEachHost(ctx context.Context, timeout time.Duration, hosts []string,
+	op func(context.Context, string, node.Node) (bluez.DeviceState, error)) []HostResult {
 	out := make([]HostResult, len(hosts))
 	var wg sync.WaitGroup
 	for i, h := range hosts {
@@ -80,19 +96,12 @@ func (s *Switcher) forEach(ctx context.Context, timeout time.Duration, hosts []s
 			defer wg.Done()
 			cctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			st, err := op(cctx, s.Nodes[h])
+			st, err := op(cctx, h, s.Nodes[h])
 			out[i] = HostResult{Host: h, State: st, Err: err}
 		}()
 	}
 	wg.Wait()
 	return out
-}
-
-// Status queries every host for the device's state.
-func (s *Switcher) Status(ctx context.Context, mac string) []HostResult {
-	return s.forEach(ctx, QueryTimeout, s.Order, func(c context.Context, n node.Node) (bluez.DeviceState, error) {
-		return n.State(c, mac)
-	})
 }
 
 // Switch moves the device to target.
@@ -105,19 +114,23 @@ func (s *Switcher) Status(ctx context.Context, mac string) []HostResult {
 // unreachable host is usually powered off and therefore can't be holding
 // the device. If a host that still reports the device as connected couldn't
 // release it, we abort instead of fighting over it.
-func (s *Switcher) Switch(ctx context.Context, mac, target string) (*Report, error) {
+func (s *Switcher) Switch(ctx context.Context, d config.Device, target string) (*Report, error) {
 	t := time.Now()
-	results := s.Status(ctx, mac)
+	results := s.Status(ctx, d)
 	s.logResults("status", results, since(t))
 	holder, _ := Holder(results)
-	return s.switchFrom(ctx, mac, target, holder)
+	return s.switchFrom(ctx, d, target, holder)
 }
 
 // switchFrom is Switch with the current holder ("" if none) already known.
-func (s *Switcher) switchFrom(ctx context.Context, mac, target, holder string) (*Report, error) {
+func (s *Switcher) switchFrom(ctx context.Context, d config.Device, target, holder string) (*Report, error) {
 	if _, ok := s.Nodes[target]; !ok {
 		return nil, fmt.Errorf("unknown host %q", target)
 	}
+	if d.MultiChannel() {
+		return s.switchChannel(ctx, d, target, holder)
+	}
+	mac := d.MAC
 	var others []string
 	for _, h := range s.Order {
 		if h != target {
@@ -185,7 +198,7 @@ func (s *Switcher) handoff(ctx context.Context, mac, target string, from []strin
 	}
 
 	rt := time.Now()
-	released = s.forEach(ctx, ReleaseTimeout, from, func(c context.Context, n node.Node) (bluez.DeviceState, error) {
+	released = s.forEachHost(ctx, ReleaseTimeout, from, func(c context.Context, _ string, n node.Node) (bluez.DeviceState, error) {
 		return n.Release(c, mac)
 	})
 	s.logResults("release", released, since(rt))
@@ -206,6 +219,68 @@ func (s *Switcher) handoff(ctx context.Context, mac, target string, from []strin
 	return released, acquired, nil
 }
 
+// switchChannel moves a multi-channel device: target starts connecting, and
+// after HeadStart the holder tells the device to change to target's channel.
+// The device then goes to target by itself. If target still can't connect,
+// nothing can call the device back (no computer is connected to it), so the
+// error says which button to press.
+func (s *Switcher) switchChannel(ctx context.Context, d config.Device, target, holder string) (*Report, error) {
+	tgt, ok := d.On(target)
+	if !ok {
+		return nil, fmt.Errorf("%s isn't set up on %s yet: on %s, pair it on a free channel and run `btshare device add %s <MAC|paired name>`",
+			d.Name, target, target, d.Name)
+	}
+	s.logf("switch %s: %q -> %q (channel %d)", d.Name, holder, target, tgt.Channel)
+	rep := &Report{Target: target}
+	actx, cancel := context.WithTimeout(ctx, AcquireTimeout)
+	defer cancel()
+	t := time.Now()
+	done := make(chan HostResult, 1)
+	go func() {
+		st, err := s.Nodes[target].Acquire(actx, tgt.MAC)
+		done <- HostResult{Host: target, State: st, Err: err}
+	}()
+
+	if holder != "" && holder != target {
+		select {
+		case r := <-done:
+			done <- r
+		case <-time.After(HeadStart):
+		case <-ctx.Done():
+		}
+		cctx, ccancel := context.WithTimeout(ctx, ReleaseTimeout)
+		ct := time.Now()
+		err := s.Nodes[holder].SetChannel(cctx, d.MACOn(holder), tgt.Channel)
+		ccancel()
+		s.logf("  channel %d via %s: err=%v (took %s)", tgt.Channel, holder, err, since(ct))
+		rep.Released = []HostResult{{Host: holder, State: bluez.DeviceState{Connected: err != nil}, Err: err}}
+		if err != nil {
+			cancel()
+			<-done
+			return rep, fmt.Errorf("%s could not switch %s to channel %d: %w", holder, d.Name, tgt.Channel, err)
+		}
+	}
+	rep.Acquired = <-done
+	s.logResults("acquire", []HostResult{rep.Acquired}, since(t))
+	if err := rep.Acquired.Err; err != nil {
+		switch {
+		case holder == "":
+			return rep, fmt.Errorf("%s could not connect: %w (no computer has %s connected, so btshare can't change its channel: press its channel button to select channel %d)",
+				target, err, d.Name, tgt.Channel)
+		case holder == target:
+			return rep, fmt.Errorf("%s could not connect: %w", target, err)
+		default:
+			back := ""
+			if h, ok := d.On(holder); ok {
+				back = fmt.Sprintf(" (channel %d)", h.Channel)
+			}
+			return rep, fmt.Errorf("%s did not connect on channel %d: %w; press %s's channel button to go back to %s%s",
+				target, tgt.Channel, err, d.Name, holder, back)
+		}
+	}
+	return rep, nil
+}
+
 func since(t time.Time) time.Duration { return time.Since(t).Round(10 * time.Millisecond) }
 
 // ErrNoHolder is returned by Holder when no host has the device connected.
@@ -222,16 +297,17 @@ func Holder(results []HostResult) (string, error) {
 }
 
 // NextTarget picks the host after the current holder in cycle order,
-// skipping hosts that are unreachable or don't know the device. With no
-// holder it starts from Self.
-func (s *Switcher) NextTarget(results []HostResult) (string, error) {
+// skipping hosts that are unreachable, don't know the device, or (for a
+// multi-channel device) have no channel. With no holder it starts from Self.
+func (s *Switcher) NextTarget(d config.Device, results []HostResult) (string, error) {
 	from, err := Holder(results)
 	if err != nil {
 		from = s.Self
 	}
 	usable := map[string]bool{}
 	for _, r := range results {
-		usable[r.Host] = r.Err == nil && r.State.Known
+		_, hasChannel := d.On(r.Host)
+		usable[r.Host] = r.Err == nil && r.State.Known && (hasChannel || !d.MultiChannel())
 	}
 	start := 0
 	for i, h := range s.Order {
@@ -249,15 +325,15 @@ func (s *Switcher) NextTarget(results []HostResult) (string, error) {
 }
 
 // Next moves the device to the next host in cycle order.
-func (s *Switcher) Next(ctx context.Context, mac string) (*Report, error) {
+func (s *Switcher) Next(ctx context.Context, d config.Device) (*Report, error) {
 	t := time.Now()
-	results := s.Status(ctx, mac)
+	results := s.Status(ctx, d)
 	s.logResults("status", results, since(t))
-	target, err := s.NextTarget(results)
+	target, err := s.NextTarget(d, results)
 	if err != nil {
-		s.logf("next %s: %v", mac, err)
+		s.logf("next %s: %v", d.Name, err)
 		return nil, err
 	}
 	holder, _ := Holder(results)
-	return s.switchFrom(ctx, mac, target, holder)
+	return s.switchFrom(ctx, d, target, holder)
 }

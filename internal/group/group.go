@@ -129,27 +129,59 @@ func RemoveDevice(ctx context.Context, cfgPath, nameOrMAC string) (config.Device
 	return d, warns, nil
 }
 
-// AddDevice appends the device locally and on every other host.
-func AddDevice(ctx context.Context, cfgPath string, d config.Device) ([]Warning, error) {
+// AddDevice shares a device: it is added (or updated) locally, and the
+// result is sent to every other host.
+//
+// here is this computer's channel of a multi-channel device, or nil for a
+// single-host device. Each computer registers its own channel by running
+// `device add` with the device connected; the entries are merged.
+func AddDevice(ctx context.Context, cfgPath string, d config.Device, here *config.DeviceHost) (config.Device, []Warning, error) {
 	if err := config.ValidName(d.Name); err != nil {
-		return nil, err
+		return d, nil, err
 	}
 	mac, err := config.ValidMAC(d.MAC)
 	if err != nil {
-		return nil, err
+		return d, nil, err
 	}
 	d.MAC = mac
+	var out config.Device
 	cfg, err := config.Update(cfgPath, func(c *config.Config) error {
 		for _, e := range c.Devices {
-			if e.MAC == d.MAC && e.Name != d.Name {
+			if e.Name != d.Name && (e.HasAddr(d.MAC) || (here != nil && e.HasAddr(here.MAC))) {
 				return fmt.Errorf("%s is already shared as %q", d.MAC, e.Name)
 			}
 		}
-		c.UpsertDevice(d)
+		existing, err := c.Device(d.Name)
+		switch {
+		case err != nil: // new device
+			out = d
+			if here != nil {
+				out.Hosts = []config.DeviceHost{*here}
+			}
+		case here != nil:
+			// Another computer's channel: keep the device's first address.
+			out = existing
+			out.Hosts = append([]config.DeviceHost(nil), existing.Hosts...)
+			if _, err := out.SetHost(*here); err != nil {
+				return err
+			}
+		case existing.MultiChannel():
+			return fmt.Errorf("%s has switchable channels, but btshare couldn't read them here; "+
+				"connect it to this computer on its own channel and run this again", d.Name)
+		default: // single-host device re-paired: new address
+			out = d
+		}
+		for i := range c.Devices {
+			if c.Devices[i].Name == out.Name {
+				c.Devices[i] = out
+				return nil
+			}
+		}
+		c.Devices = append(c.Devices, out)
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return d, nil, err
 	}
 	var warns []Warning
 	for _, h := range cfg.Hosts {
@@ -157,11 +189,11 @@ func AddDevice(ctx context.Context, cfgPath string, d config.Device) ([]Warning,
 			continue
 		}
 		cctx, cancel := context.WithTimeout(ctx, Timeout)
-		err := remote(cfg, h.Addr).AddDevice(cctx, d)
+		err := remote(cfg, h.Addr).AddDevice(cctx, out)
 		cancel()
 		if err != nil {
 			warns = append(warns, Warning{h.Name, err})
 		}
 	}
-	return warns, nil
+	return out, warns, nil
 }

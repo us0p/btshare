@@ -320,8 +320,9 @@ func (c *Client) Acquire(ctx context.Context, mac string) (DeviceState, error) {
 
 // PairedDevice is a device bonded with this adapter.
 type PairedDevice struct {
-	MAC  string
-	Name string
+	MAC       string
+	Name      string
+	Connected bool
 }
 
 // Paired lists the devices paired with this adapter.
@@ -343,6 +344,7 @@ func (c *Client) Paired() ([]PairedDevice, error) {
 		d := PairedDevice{}
 		d.MAC, _ = props["Address"].Value().(string)
 		d.Name, _ = props["Alias"].Value().(string)
+		d.Connected, _ = props["Connected"].Value().(bool)
 		out = append(out, d)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
