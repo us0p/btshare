@@ -147,7 +147,9 @@ func (s *Switcher) switchFrom(ctx context.Context, d config.Device, target, hold
 	if err := rep.Acquired.Err; err != nil {
 		err = fmt.Errorf("%s could not connect: %w", target, err)
 		if holder == "" || holder == target {
-			return rep, err
+			// Nothing to hand back to. The target is left unblocked and every
+			// other host blocked, so the device can only go to the target.
+			return rep, fmt.Errorf("%w; it is free to connect only to %s now: click or move it to wake it (or run `btshare here` on the computer you want it on)", err, target)
 		}
 		return rep, s.restore(ctx, rep, mac, target, holder, err)
 	}
@@ -169,7 +171,7 @@ func (s *Switcher) restore(ctx context.Context, rep *Report, mac, target, holder
 		err = aerr
 	}
 	if err != nil {
-		return fmt.Errorf("%w; giving it back to %s also failed: %w (run `btshare here` on %s)", cause, holder, err, holder)
+		return fmt.Errorf("%w; giving it back to %s also failed: %w; it is free to connect only to %s now: click or move it to wake it (or run `btshare here` on the computer you want it on)", cause, holder, err, holder)
 	}
 	return fmt.Errorf("%w; it is back on %s", cause, holder)
 }
@@ -304,11 +306,23 @@ func (s *Switcher) NextTarget(d config.Device, results []HostResult) (string, er
 	if err != nil {
 		from = s.Self
 	}
-	usable := map[string]bool{}
+	return s.nextAfter(from, func(h string) bool { return usableOn(d, results, h) })
+}
+
+// usableOn reports whether host h can take the device: it answered, knows
+// the device and, for a multi-channel device, has a channel for it.
+func usableOn(d config.Device, results []HostResult, h string) bool {
+	_, hasChannel := d.On(h)
 	for _, r := range results {
-		_, hasChannel := d.On(r.Host)
-		usable[r.Host] = r.Err == nil && r.State.Known && (hasChannel || !d.MultiChannel())
+		if r.Host == h {
+			return r.Err == nil && r.State.Known && (hasChannel || !d.MultiChannel())
+		}
 	}
+	return false
+}
+
+// nextAfter returns the first host after from, in cycle order, that is usable.
+func (s *Switcher) nextAfter(from string, usable func(string) bool) (string, error) {
 	start := 0
 	for i, h := range s.Order {
 		if h == from {
@@ -317,7 +331,7 @@ func (s *Switcher) NextTarget(d config.Device, results []HostResult) (string, er
 	}
 	for k := 1; k <= len(s.Order); k++ {
 		h := s.Order[(start+k)%len(s.Order)]
-		if h != from && usable[h] {
+		if h != from && usable(h) {
 			return h, nil
 		}
 	}
@@ -336,4 +350,97 @@ func (s *Switcher) Next(ctx context.Context, d config.Device) (*Report, error) {
 	}
 	holder, _ := Holder(results)
 	return s.switchFrom(ctx, d, target, holder)
+}
+
+// DeviceResult is one device's outcome of NextAll.
+type DeviceResult struct {
+	Device config.Device
+	Report *Report // nil if the device was skipped or failed before switching
+	// Skipped is set when the device was left where it is on purpose, and
+	// says why (it is already on the target, or connected nowhere).
+	Skipped string
+	Err     error
+}
+
+// NextAll moves every device to one common target, so they always travel
+// together. Moving each device to the host after its own holder would send
+// devices that sit on different computers in opposite directions.
+//
+// The target is the host after this computer if any device is connected
+// here, otherwise the host after the first device's holder (with nothing
+// connected anywhere, the host after this computer). Devices already on the
+// target are left alone, and so are devices connected nowhere: they're
+// usually turned off, and waiting for them would only time out.
+func (s *Switcher) NextAll(ctx context.Context, devs []config.Device) (string, []DeviceResult, error) {
+	statuses := make([][]HostResult, len(devs))
+	holders := make([]string, len(devs))
+	from := ""
+	for i, d := range devs {
+		t := time.Now()
+		statuses[i] = s.Status(ctx, d)
+		s.logResults("status "+d.Name, statuses[i], since(t))
+		holders[i], _ = Holder(statuses[i])
+		if holders[i] == s.Self || (from == "" && holders[i] != "") {
+			from = holders[i]
+		}
+	}
+	if from == "" {
+		from = s.Self
+	}
+	target, err := s.nextAfter(from, func(h string) bool {
+		for i, d := range devs {
+			if usableOn(d, statuses[i], h) {
+				return true
+			}
+		}
+		return false
+	})
+	if err != nil {
+		err = errors.New("no other reachable host has any of these devices paired")
+		s.logf("next: %v", err)
+		return "", nil, err
+	}
+	s.logf("next: all devices %q -> %q", from, target)
+
+	out := make([]DeviceResult, len(devs))
+	for i, d := range devs {
+		r := &out[i]
+		r.Device = d
+		switch {
+		case holders[i] == target:
+			r.Skipped = "already on " + target
+		case holders[i] == "":
+			r.Skipped = "not connected to any computer (turned off?)"
+		case !usableOn(d, statuses[i], target):
+			r.Err = fmt.Errorf("not set up on %s (%s)", target, whyNotUsable(d, statuses[i], target))
+		default:
+			r.Report, r.Err = s.switchFrom(ctx, d, target, holders[i])
+		}
+		if r.Skipped != "" {
+			s.logf("next %s: left on %q: %s", d.Name, holders[i], r.Skipped)
+		}
+	}
+	return target, out, nil
+}
+
+// whyNotUsable explains why host h can't take the device.
+func whyNotUsable(d config.Device, results []HostResult, h string) string {
+	for _, r := range results {
+		if r.Host != h {
+			continue
+		}
+		switch {
+		case r.Err != nil:
+			return fmt.Sprintf("unreachable: %v", r.Err)
+		case !r.State.Known:
+			if d.MultiChannel() {
+				return "not paired there"
+			}
+			return "not paired there: copy the pairing with `btshare keys export` / `keys import`"
+		}
+	}
+	if _, ok := d.On(h); d.MultiChannel() && !ok {
+		return fmt.Sprintf("no channel registered: run `btshare device add %s` there with it connected", d.Name)
+	}
+	return "unknown host"
 }

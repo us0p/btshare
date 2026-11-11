@@ -101,6 +101,13 @@ func (l *Local) Acquire(ctx context.Context, mac string) (bluez.DeviceState, err
 	return l.bz.Acquire(ctx, mac)
 }
 
+// Unblock lets the device connect to this host again (see bluez.Client.Unblock).
+func (l *Local) Unblock(_ context.Context, mac string) (bluez.DeviceState, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.bz.Unblock(mac)
+}
+
 func (l *Local) SetChannel(_ context.Context, mac string, channel int) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()

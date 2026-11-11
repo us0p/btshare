@@ -150,11 +150,18 @@ shred -u mouse.bundle.json
 ```sh
 btshare status                # who has what
 btshare switch mouse laptop   # move it to a specific computer
-btshare next mouse            # cycle to the next computer (what the hotkey runs)
+btshare next                  # move every shared device to the next computer (what the hotkey runs)
+btshare next mouse            # move just this one to the computer after the one that has it
 btshare here                  # pull every shared device to this computer
 ```
 
 Any computer can run these, including one that doesn't have the device.
+
+With several devices, `btshare next` moves them together: everything goes
+to the computer after this one if anything is connected here, otherwise to
+the computer after the one that has them. A device that is already there
+is left alone, and so is one that isn't connected anywhere (usually because
+it's turned off), so switching doesn't stall waiting for it.
 
 ### Managing devices
 
@@ -162,7 +169,9 @@ Any computer can run these, including one that doesn't have the device.
 btshare device remove mouse    # stop sharing it, on every computer
 ```
 
-Removing never touches Bluetooth pairings (`bluetoothctl remove <MAC>` does).
+Removing never touches Bluetooth pairings (`bluetoothctl remove <MAC>` does),
+but it unblocks the device on every computer, so one that btshare had
+released isn't left unusable there.
 If a single-host device was re-paired and got a new address (some Logitech
 mice do), run `btshare device add` with the same name again. For a
 multi-channel device, re-run `device add` on the computer whose channel was re-paired.
@@ -215,6 +224,23 @@ meanwhile (`Connected`, `ServicesResolved`, ...). Read it with
 `journalctl -t btshare --since "-10 min"`, or watch it live with `btshare -v next`.
 A connect that stays "pending" with no property changes means the device was
 never heard from: it isn't advertising to this computer.
+
+Single-host devices:
+
+- *"is free to connect only to X now"*: the switch failed and nothing could
+  take the device back (it was asleep, or the rollback failed too). It is
+  unblocked on X and blocked everywhere else, so it isn't lost: click or move
+  it to wake it and it connects to X. To have it elsewhere, run `btshare here`
+  on that computer. Don't forget and re-pair it: that gives it new keys (and,
+  for some mice, a new address), so every computer needs the keys again.
+- *"not set up on X"* from `btshare next`: X doesn't have the pairing. Copy it
+  with `btshare keys export` / `keys import` (step 4b).
+
+Triggering a switch from a device's own button (for example a Solaar rule
+running `btshare -notify next`) works best with `next` and no device name:
+all devices move together, so the mouse with the button comes along and you
+can press it again on the other computer. Keep the keyboard shortcut set up
+on every computer as a fallback.
 
 Multi-channel devices:
 

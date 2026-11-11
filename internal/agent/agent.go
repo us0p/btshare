@@ -222,7 +222,18 @@ func (s *Server) removeDevice(w http.ResponseWriter, r *http.Request, body []byt
 		return
 	}
 	s.logf("device removed: %s %s from %s (was present=%v)", req.Device.Name, req.Device.MAC, r.RemoteAddr, removed)
+	// btshare no longer manages it, so don't leave it blocked here by an
+	// earlier release (multi-channel devices are never blocked).
+	if u, ok := s.Node.(unblocker); ok && removed && !req.Device.MultiChannel() {
+		st, err := u.Unblock(r.Context(), req.Device.MAC)
+		s.logf("device removed: unblock %s -> blocked=%v err=%v", req.Device.MAC, st.Blocked, err)
+	}
 	writeJSON(w, http.StatusOK, node.ErrorResponse{})
+}
+
+// unblocker is implemented by node.Local.
+type unblocker interface {
+	Unblock(ctx context.Context, mac string) (bluez.DeviceState, error)
 }
 
 func (s *Server) notifyError(summary, body string) {

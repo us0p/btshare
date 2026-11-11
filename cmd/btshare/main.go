@@ -536,7 +536,16 @@ func runDevice(ctx context.Context, args []string) error {
 			label = d.Name + " (" + d.MAC + ")"
 		}
 		fmt.Printf("stopped sharing %s on %d computer(s)\n", label, len(cfg.Hosts)-len(warns))
-		fmt.Printf("its Bluetooth pairing is untouched; to forget it too: bluetoothctl remove %s (on each computer)\n", d.MAC)
+		// The peers unblock it when they remove it; do the same here so an
+		// earlier release doesn't leave it unusable on this computer.
+		if !d.MultiChannel() {
+			if l, err := node.NewLocal(cfg.Adapter, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not unblock it here: %v\n", err)
+			} else if _, err := l.Unblock(ctx, d.MAC); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not unblock it here: %v (run: bluetoothctl unblock %s)\n", err, d.MAC)
+			}
+		}
+		fmt.Printf("its Bluetooth pairing is kept and it is no longer blocked; to forget it too: bluetoothctl remove %s (on each computer)\n", d.MAC)
 		return nil
 	}
 	return fmt.Errorf("unknown device subcommand %q", args[0])
@@ -663,6 +672,9 @@ func runSwitch(ctx context.Context, device, target string) error {
 	if len(devs) == 0 {
 		return errors.New("no shared devices yet (add one with `btshare device add`)")
 	}
+	if target == "@next" && device == "" {
+		return runNextAll(ctx, s, devs)
+	}
 	var moved, failed []string
 	for _, d := range devs {
 		var rep *switcher.Report
@@ -692,6 +704,44 @@ func runSwitch(ctx context.Context, device, target string) error {
 	}
 	if len(moved) > 0 {
 		desktopNotify("btshare", strings.Join(moved, "\n"))
+	}
+	if len(failed) > 0 {
+		return errors.New(strings.Join(failed, "; "))
+	}
+	return nil
+}
+
+// runNextAll moves all devices together to the next computer (see
+// switcher.NextAll).
+func runNextAll(ctx context.Context, s *switcher.Switcher, devs []config.Device) error {
+	target, results, err := s.NextAll(ctx, devs)
+	if err != nil {
+		return err
+	}
+	var lines, failed []string
+	for _, r := range results {
+		if r.Report != nil {
+			for _, rel := range r.Report.Released {
+				if rel.Err != nil {
+					fmt.Fprintf(os.Stderr, "warning: %s: %s: %v\n", r.Device.Name, rel.Host, rel.Err)
+				}
+			}
+		}
+		var line string
+		switch {
+		case r.Err != nil:
+			failed = append(failed, fmt.Sprintf("%s: %v", r.Device.Name, r.Err))
+			continue
+		case r.Skipped != "":
+			line = fmt.Sprintf("%s: %s", r.Device.Name, r.Skipped)
+		default:
+			line = fmt.Sprintf("%s → %s", r.Device.Name, target)
+		}
+		fmt.Println(line)
+		lines = append(lines, line)
+	}
+	if len(lines) > 0 {
+		desktopNotify("btshare → "+target, strings.Join(lines, "\n"))
 	}
 	if len(failed) > 0 {
 		return errors.New(strings.Join(failed, "; "))

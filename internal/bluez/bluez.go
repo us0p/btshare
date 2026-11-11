@@ -252,6 +252,21 @@ func (c *Client) Release(mac string) (DeviceState, error) {
 	return c.State(mac)
 }
 
+// Unblock lets the device connect to this host again, without connecting
+// it. Used when btshare stops managing a device, so it isn't left blocked.
+func (c *Client) Unblock(mac string) (DeviceState, error) {
+	st, err := c.State(mac)
+	if err != nil || !st.Known || !st.Blocked {
+		return st, err
+	}
+	if err := c.setProp(c.devicePath(mac), ifaceDevice, "Blocked", false); err != nil {
+		c.logf("unblock %s: %s", mac, dbusErr(err))
+		return st, fmt.Errorf("unblock: %w", err)
+	}
+	c.logf("unblock %s: done", mac)
+	return c.State(mac)
+}
+
 func since(t time.Time) time.Duration { return time.Since(t).Round(10 * time.Millisecond) }
 
 // Acquire unblocks, trusts and connects the device, retrying until ctx expires
@@ -302,6 +317,16 @@ func (c *Client) Acquire(ctx context.Context, mac string) (DeviceState, error) {
 			return c.State(mac)
 		}
 		lastErr = call.Err
+		if inProgress(call.Err) {
+			// A connect is already pending in BlueZ: our previous call that
+			// hit a deadline, or BlueZ's own reconnect after the unblock.
+			// Another Connect only fails the same way, so wait for that one.
+			c.logf("acquire %s: Connect #%d: a connect is already in progress, waiting for it", mac, attempt)
+			if st, ok := c.waitConnected(ctx, mac); ok {
+				c.logf("acquire %s: connected (pending connect) after %s; after: %s", mac, since(start), c.describe(mac))
+				return st, nil
+			}
+		}
 		if ctx.Err() != nil {
 			// BlueZ hadn't answered yet; our deadline cut the call short.
 			c.logf("acquire %s: Connect #%d still pending after %s when the deadline hit; after: %s",
@@ -314,6 +339,38 @@ func (c *Client) Acquire(ctx context.Context, mac string) (DeviceState, error) {
 			c.logf("acquire %s: gave up after %s and %d attempt(s)", mac, since(start), attempt)
 			return st, fmt.Errorf("connect timed out (is the device awake? try moving it): %w", lastErr)
 		case <-time.After(750 * time.Millisecond):
+		}
+	}
+}
+
+// inProgress reports whether err is BlueZ refusing a Connect because
+// another connect to the device is still pending.
+func inProgress(err error) bool {
+	var de dbus.Error
+	return errors.As(err, &de) && de.Name == "org.bluez.Error.InProgress"
+}
+
+// waitConnected polls the device until it is connected (true), ctx expires,
+// or BlueZ stops trying (false; it is then neither connected nor
+// connecting, so a new Connect may succeed).
+func (c *Client) waitConnected(ctx context.Context, mac string) (DeviceState, bool) {
+	const poll = 200 * time.Millisecond
+	idle := 0
+	for {
+		st, err := c.State(mac)
+		if err == nil && st.Connected {
+			return st, true
+		}
+		// BlueZ doesn't expose "connecting", so give the pending connect a
+		// few seconds before asking again; a page or LE connect attempt
+		// normally ends well within that.
+		if idle++; idle*int(poll/time.Millisecond) >= 5000 {
+			return st, false
+		}
+		select {
+		case <-ctx.Done():
+			return st, false
+		case <-time.After(poll):
 		}
 	}
 }
