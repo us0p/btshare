@@ -1,0 +1,37 @@
+# Pull requests into main must come from this repository's develop branch
+# and be opened by the repository owner. The ruleset on main requires this
+# check, so any other pull request can't be merged.
+name: Main PR guard
+
+on:
+  pull_request:
+    branches: [main]
+    # "edited" re-runs it when someone retargets a pull request to main.
+    types: [opened, reopened, synchronize, edited]
+
+permissions: {}
+
+jobs:
+  guard:
+    name: PR to main comes from develop, by the owner
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check source branch and author
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+        run: |
+          ok=1
+          if [[ $HEAD_REPO != "$REPO" || $HEAD_REF != develop ]]; then
+            echo "::error::Pull requests into main must come from $REPO:develop, not $HEAD_REPO:$HEAD_REF. Open your pull request against develop."
+            ok=0
+          fi
+          if [[ $AUTHOR != "$OWNER" ]]; then
+            echo "::error::Only $OWNER opens pull requests into main (this one is by $AUTHOR)."
+            ok=0
+          fi
+          ((ok)) && echo "OK: $HEAD_REPO:$HEAD_REF by $AUTHOR"
+          ((ok))
