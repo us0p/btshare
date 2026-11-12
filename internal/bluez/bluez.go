@@ -236,14 +236,25 @@ func (c *Client) Release(mac string) (DeviceState, error) {
 	}
 	defer c.watch(mac)()
 	p := c.devicePath(mac)
-	if st.Connected {
-		t := time.Now()
-		if err := c.obj(p).Call(ifaceDevice+".Disconnect", 0).Err; err != nil {
-			c.logf("release %s: Disconnect failed after %s: %s", mac, since(t), dbusErr(err))
-			return st, fmt.Errorf("disconnect: %w", err)
-		}
-		c.logf("release %s: Disconnect ok in %s", mac, since(t))
+	// Blocking alone doesn't stop this host from grabbing the device back:
+	// the kernel connects LE devices on its auto-connect list by itself,
+	// ignores BlueZ's block while doing so, and races the target for the
+	// device every time it advertises. BlueZ takes a device off that list
+	// when Disconnect is called on it while it is untrusted ("disable
+	// connections through passive scanning until Device1.Connect is
+	// called"), so untrust it first, then call Disconnect even when it is
+	// not connected. That also cancels a Connect still pending from an
+	// earlier acquire. Acquire trusts it again.
+	if err := c.setProp(p, ifaceDevice, "Trusted", false); err != nil {
+		c.logf("release %s: untrust failed: %s", mac, dbusErr(err))
+		return st, fmt.Errorf("untrust: %w", err)
 	}
+	t := time.Now()
+	if err := c.obj(p).Call(ifaceDevice+".Disconnect", 0).Err; err != nil {
+		c.logf("release %s: Disconnect failed after %s: %s", mac, since(t), dbusErr(err))
+		return st, fmt.Errorf("disconnect: %w", err)
+	}
+	c.logf("release %s: Disconnect ok in %s (was connected=%v)", mac, since(t), st.Connected)
 	if err := c.setProp(p, ifaceDevice, "Blocked", true); err != nil {
 		c.logf("release %s: block failed: %s", mac, dbusErr(err))
 		return st, fmt.Errorf("block: %w", err)
@@ -254,14 +265,21 @@ func (c *Client) Release(mac string) (DeviceState, error) {
 
 // Unblock lets the device connect to this host again, without connecting
 // it. Used when btshare stops managing a device, so it isn't left blocked.
+// It also trusts it again (Release untrusted it), which puts it back on the
+// kernel's auto-connect list so it reconnects by itself like any device.
 func (c *Client) Unblock(mac string) (DeviceState, error) {
 	st, err := c.State(mac)
 	if err != nil || !st.Known || !st.Blocked {
 		return st, err
 	}
-	if err := c.setProp(c.devicePath(mac), ifaceDevice, "Blocked", false); err != nil {
+	p := c.devicePath(mac)
+	if err := c.setProp(p, ifaceDevice, "Blocked", false); err != nil {
 		c.logf("unblock %s: %s", mac, dbusErr(err))
 		return st, fmt.Errorf("unblock: %w", err)
+	}
+	if err := c.setProp(p, ifaceDevice, "Trusted", true); err != nil {
+		c.logf("unblock %s: trust: %s", mac, dbusErr(err))
+		return st, fmt.Errorf("trust: %w", err)
 	}
 	c.logf("unblock %s: done", mac)
 	return c.State(mac)
