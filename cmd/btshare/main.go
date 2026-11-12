@@ -102,6 +102,15 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if err := run(args); err != nil {
+		fmt.Fprintln(os.Stderr, "btshare:", err)
+		desktopNotify("btshare failed", err.Error())
+		os.Exit(1)
+	}
+}
+
+// run executes one command; main turns its error into the exit status.
+func run(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -157,11 +166,7 @@ func main() {
 	default:
 		err = fmt.Errorf("unknown command %q (see btshare help)", cmd)
 	}
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "btshare:", err)
-		desktopNotify("btshare failed", err.Error())
-		os.Exit(1)
-	}
+	return err
 }
 
 var notifier = notify.New("btshare")
@@ -225,7 +230,8 @@ func runAgent(ctx context.Context) error {
 	}
 	go func() {
 		<-ctx.Done()
-		sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		// ctx is already canceled here; shutdown gets its own deadline.
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 	}()
@@ -357,10 +363,7 @@ func runJoin(ctx context.Context, args []string) error {
 	}
 	secret := *secretFlag
 	if secret == "" {
-		var err error
-		if secret, err = readSecret(addr); err != nil {
-			return err
-		}
+		secret = readSecret(addr)
 	}
 	cfg, warns, err := group.Join(ctx, *configPath, withPort(addr), secret)
 	if err != nil {
@@ -380,18 +383,19 @@ func runJoin(ctx context.Context, args []string) error {
 // device such as /dev/null).
 func isTerminal(f *os.File) bool {
 	var t syscall.Termios
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TCGETS, uintptr(unsafe.Pointer(&t)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), syscall.TCGETS,
+		uintptr(unsafe.Pointer(&t))) //nolint:gosec // TCGETS only fills t, sized by the kernel's termios
 	return errno == 0
 }
 
 // readSecret asks for the group secret without echoing it. Enter keeps
 // this computer's current secret. Without a terminal it reads one line
 // from stdin (install.sh passes nothing: it has set the secret already).
-func readSecret(addr string) (string, error) {
+func readSecret(addr string) string {
 	if !isTerminal(os.Stdin) {
 		var line string
 		_, _ = fmt.Fscanln(os.Stdin, &line)
-		return strings.TrimSpace(line), nil
+		return strings.TrimSpace(line)
 	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -408,7 +412,7 @@ func readSecret(addr string) (string, error) {
 	_, _ = fmt.Fscanln(os.Stdin, &line)
 	stty("echo")
 	fmt.Fprintln(os.Stderr)
-	return strings.TrimSpace(line), nil
+	return strings.TrimSpace(line)
 }
 
 func runInvite() error {
@@ -437,7 +441,7 @@ func runHost(args []string) error {
 
 func runDevice(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: btshare device add|remove|list ...")
+		return errors.New("usage: btshare device add|remove|list")
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -532,7 +536,16 @@ func runDevice(ctx context.Context, args []string) error {
 			label = d.Name + " (" + d.MAC + ")"
 		}
 		fmt.Printf("stopped sharing %s on %d computer(s)\n", label, len(cfg.Hosts)-len(warns))
-		fmt.Printf("its Bluetooth pairing is untouched; to forget it too: bluetoothctl remove %s (on each computer)\n", d.MAC)
+		// The peers unblock it when they remove it; do the same here so an
+		// earlier release doesn't leave it unusable on this computer.
+		if !d.MultiChannel() {
+			if l, err := node.NewLocal(cfg.Adapter, nil); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not unblock it here: %v\n", err)
+			} else if _, err := l.Unblock(ctx, d.MAC); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not unblock it here: %v (run: bluetoothctl unblock %s)\n", err, d.MAC)
+			}
+		}
+		fmt.Printf("its Bluetooth pairing is kept and it is no longer released (blocked or untrusted) here; to forget it too: bluetoothctl remove %s (on each computer)\n", d.MAC)
 		return nil
 	}
 	return fmt.Errorf("unknown device subcommand %q", args[0])
@@ -634,7 +647,7 @@ func describe(r switcher.HostResult) string {
 		return "not paired"
 	case r.State.Connected:
 		return "CONNECTED"
-	case r.State.Blocked:
+	case r.State.Blocked || !r.State.Trusted:
 		return "released"
 	default:
 		return "not connected"
@@ -643,7 +656,34 @@ func describe(r switcher.HostResult) string {
 
 // runSwitch moves one device, or every configured device when device is "".
 // target is a host name, "@next" or "@here".
+// switchLock makes switches on this computer run one at a time. A second
+// press of the hotkey while one is running would otherwise race it: each
+// releases the device the other is connecting, and it can end up released
+// on every computer. The lock is released when the process exits.
+func switchLock() error {
+	dir := os.Getenv("XDG_RUNTIME_DIR")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	f, err := os.OpenFile(dir+"/btshare-switch.lock", os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // the user's own runtime directory
+	if err != nil {
+		return nil // can't lock: better to switch than to refuse
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return errors.New("a switch is already running on this computer; wait for it to finish (it gives up in under a minute)")
+		}
+		return nil
+	}
+	// f stays open (and locked) until the process exits.
+	return nil
+}
+
 func runSwitch(ctx context.Context, device, target string) error {
+	if err := switchLock(); err != nil {
+		return err
+	}
 	cfg, s, err := loadSwitcher()
 	if err != nil {
 		return err
@@ -658,6 +698,9 @@ func runSwitch(ctx context.Context, device, target string) error {
 	}
 	if len(devs) == 0 {
 		return errors.New("no shared devices yet (add one with `btshare device add`)")
+	}
+	if target == "@next" && device == "" {
+		return runNextAll(ctx, s, devs)
 	}
 	var moved, failed []string
 	for _, d := range devs {
@@ -695,9 +738,47 @@ func runSwitch(ctx context.Context, device, target string) error {
 	return nil
 }
 
+// runNextAll moves all devices together to the next computer (see
+// switcher.NextAll).
+func runNextAll(ctx context.Context, s *switcher.Switcher, devs []config.Device) error {
+	target, results, err := s.NextAll(ctx, devs)
+	if err != nil {
+		return err
+	}
+	var lines, failed []string
+	for _, r := range results {
+		if r.Report != nil {
+			for _, rel := range r.Report.Released {
+				if rel.Err != nil {
+					fmt.Fprintf(os.Stderr, "warning: %s: %s: %v\n", r.Device.Name, rel.Host, rel.Err)
+				}
+			}
+		}
+		var line string
+		switch {
+		case r.Err != nil:
+			failed = append(failed, fmt.Sprintf("%s: %v", r.Device.Name, r.Err))
+			continue
+		case r.Skipped != "":
+			line = fmt.Sprintf("%s: %s", r.Device.Name, r.Skipped)
+		default:
+			line = fmt.Sprintf("%s → %s", r.Device.Name, target)
+		}
+		fmt.Println(line)
+		lines = append(lines, line)
+	}
+	if len(lines) > 0 {
+		desktopNotify("btshare → "+target, strings.Join(lines, "\n"))
+	}
+	if len(failed) > 0 {
+		return errors.New(strings.Join(failed, "; "))
+	}
+	return nil
+}
+
 func runKeys(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: btshare keys export|import ...")
+		return errors.New("usage: btshare keys export|import")
 	}
 	fs := flag.NewFlagSet("keys "+args[0], flag.ContinueOnError)
 	root := fs.String("root", keys.DefaultRoot, "BlueZ storage directory")
@@ -791,7 +872,7 @@ func runKeys(ctx context.Context, args []string) error {
 		}
 		if !*noRestart {
 			if out, err := exec.CommandContext(ctx, "systemctl", "restart", "bluetooth").CombinedOutput(); err != nil {
-				return fmt.Errorf("restart bluetooth: %v: %s", err, out)
+				return fmt.Errorf("restart bluetooth: %w: %s", err, out)
 			}
 			fmt.Fprintln(os.Stderr, "restarted bluetooth.service")
 		}
@@ -849,15 +930,37 @@ func setPublicAddress(adapter, addr string) error {
 	} {
 		out, err := runBtmgmt(a...)
 		if err != nil {
-			return fmt.Errorf("btmgmt %s: %v: %s", strings.Join(a, " "), err, out)
+			return fmt.Errorf("btmgmt %s: %w: %s", strings.Join(a, " "), err, out)
 		}
 	}
-	got, err := adapterAddress(adapter)
+	got, err := waitForAddress(func() (string, error) { return adapterAddress(adapter) }, addr, adapterReappearTimeout)
 	if err != nil {
-		return err
+		return fmt.Errorf("adapter %s did not come back after the address change: %w", adapter, err)
 	}
 	if !strings.EqualFold(got, addr) {
 		return fmt.Errorf("controller did not accept the new address (still %s); it likely doesn't support public-addr", got)
 	}
 	return nil
+}
+
+// adapterReappearTimeout bounds how long we wait for bluetoothd to re-register
+// the adapter after its address changes.
+const adapterReappearTimeout = 10 * time.Second
+
+// waitForAddress polls get until it reports want or timeout passes. After
+// `btmgmt public-addr` + power on, bluetoothd removes and re-adds the adapter's
+// D-Bus object, so the first reads fail or still return the old address.
+// It returns the last address read (to report a refused change) or the last error.
+func waitForAddress(get func() (string, error), want string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		got, err := get()
+		if err == nil && strings.EqualFold(got, want) {
+			return got, nil
+		}
+		if time.Now().After(deadline) {
+			return got, err
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }

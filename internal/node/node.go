@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,11 +66,31 @@ type ErrorResponse struct {
 
 // ---- local ----
 
-// Local drives this host's adapter. BlueZ calls are serialized so a local
-// CLI call and agent requests can't interleave a release with an acquire.
+// Local drives this host's adapter. Changes to one device are serialized,
+// so a local CLI call and agent requests can't interleave a release with an
+// acquire of it. Different devices don't wait for each other (a 15s connect
+// of one mouse mustn't hold up another), and State never waits: it only
+// reads, and a status query stuck behind a connect times out on the caller.
 type Local struct {
-	mu sync.Mutex
-	bz *bluez.Client
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex // by MAC
+	bz    *bluez.Client
+}
+
+// lock locks mac's device and returns the unlock function.
+func (l *Local) lock(mac string) func() {
+	l.mu.Lock()
+	if l.locks == nil {
+		l.locks = map[string]*sync.Mutex{}
+	}
+	m := l.locks[strings.ToUpper(mac)]
+	if m == nil {
+		m = &sync.Mutex{}
+		l.locks[strings.ToUpper(mac)] = m
+	}
+	l.mu.Unlock()
+	m.Lock()
+	return m.Unlock
 }
 
 // NewLocal opens this host's adapter. logf, if not nil, receives a detailed
@@ -84,26 +105,27 @@ func NewLocal(adapter string, logf func(format string, args ...any)) (*Local, er
 }
 
 func (l *Local) State(_ context.Context, mac string) (bluez.DeviceState, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	return l.bz.State(mac)
 }
 
 func (l *Local) Release(_ context.Context, mac string) (bluez.DeviceState, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.lock(mac)()
 	return l.bz.Release(mac)
 }
 
 func (l *Local) Acquire(ctx context.Context, mac string) (bluez.DeviceState, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.lock(mac)()
 	return l.bz.Acquire(ctx, mac)
 }
 
+// Unblock lets the device connect to this host again (see bluez.Client.Unblock).
+func (l *Local) Unblock(_ context.Context, mac string) (bluez.DeviceState, error) {
+	defer l.lock(mac)()
+	return l.bz.Unblock(mac)
+}
+
 func (l *Local) SetChannel(_ context.Context, mac string, channel int) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	defer l.lock(mac)()
 	if l.bz.Logf != nil {
 		l.bz.Logf("channel %s: switching it to channel %d", mac, channel)
 	}

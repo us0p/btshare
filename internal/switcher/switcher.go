@@ -6,13 +6,14 @@
 // like pressing its channel button. Nothing is released or blocked.
 //
 // Single-host devices have one pairing that every computer shares. The target starts
-// acquiring first (unblocked and waiting for the device), then every other
+// acquiring first (trusted and waiting for the device), then every other
 // host releases it: a BLE device sends only a short burst of reconnection
 // advertising right after a disconnect, so the target must already be
 // listening when that happens. If the target can't connect, the device is
 // handed back to the host that had it the same way. A device holds one
-// connection at a time, and hosts that release it block it, so it never
-// ends up connected to two hosts.
+// connection at a time, and hosts that release it stop reconnecting it (they
+// untrust it, see bluez.Client.Release), so it never ends up connected to two
+// hosts.
 package switcher
 
 import (
@@ -108,7 +109,7 @@ func (s *Switcher) forEachHost(ctx context.Context, timeout time.Duration, hosts
 //
 // If the target can't connect, the device is released there again and
 // reconnected to the host that held it before (see Report.Restored), so a
-// failed switch doesn't leave it blocked everywhere.
+// failed switch doesn't leave it released everywhere.
 //
 // Release failures on other hosts are reported but don't abort: an
 // unreachable host is usually powered off and therefore can't be holding
@@ -147,7 +148,9 @@ func (s *Switcher) switchFrom(ctx context.Context, d config.Device, target, hold
 	if err := rep.Acquired.Err; err != nil {
 		err = fmt.Errorf("%s could not connect: %w", target, err)
 		if holder == "" || holder == target {
-			return rep, err
+			// Nothing to hand back to. The target is left trusted and every
+			// other host released, so the device can only go to the target.
+			return rep, fmt.Errorf("%w; it is free to connect only to %s now: click or move it to wake it (or run `btshare here` on the computer you want it on)", err, target)
 		}
 		return rep, s.restore(ctx, rep, mac, target, holder, err)
 	}
@@ -155,12 +158,12 @@ func (s *Switcher) switchFrom(ctx context.Context, d config.Device, target, hold
 }
 
 // restore hands the device back to holder after target failed to connect.
-// It runs even if ctx was cancelled (e.g. Ctrl+C mid-switch): stopping here
-// would leave the device blocked on every host.
+// It runs even if ctx was canceled (e.g. Ctrl+C mid-switch): stopping here
+// would leave the device released on every host.
 func (s *Switcher) restore(ctx context.Context, rep *Report, mac, target, holder string, cause error) error {
 	ctx = context.WithoutCancel(ctx)
 	// Same handoff in reverse: the holder starts acquiring, then the target
-	// is blocked again so it can't grab the device late.
+	// releases it again so it can't grab the device late.
 	s.logf("switch %s: rolling back to %s", mac, holder)
 	_, acquired, aerr := s.handoff(ctx, mac, holder, []string{target})
 	rep.Restored = &acquired
@@ -169,14 +172,14 @@ func (s *Switcher) restore(ctx context.Context, rep *Report, mac, target, holder
 		err = aerr
 	}
 	if err != nil {
-		return fmt.Errorf("%w; giving it back to %s also failed: %v (run `btshare here` on %s)", cause, holder, err, holder)
+		return fmt.Errorf("%w; giving it back to %s also failed: %w; it is free to connect only to %s now: click or move it to wake it (or run `btshare here` on the computer you want it on)", cause, holder, err, holder)
 	}
 	return fmt.Errorf("%w; it is back on %s", cause, holder)
 }
 
 // handoff moves the device to target: target starts acquiring, and after
 // HeadStart the hosts in from release it in parallel. If a host that still
-// has the device connected fails to release it, the acquire is cancelled,
+// has the device connected fails to release it, the acquire is canceled,
 // target is blocked again and a non-nil abort error is returned.
 func (s *Switcher) handoff(ctx context.Context, mac, target string, from []string) (released []HostResult, acquired HostResult, abort error) {
 	actx, cancel := context.WithTimeout(ctx, AcquireTimeout)
@@ -207,7 +210,7 @@ func (s *Switcher) handoff(ctx context.Context, mac, target string, from []strin
 			s.logf("switch %s: aborted, %s still holds it", mac, r.Host)
 			cancel()
 			<-done
-			// Undo the target's unblock so it doesn't grab the device later.
+			// Release it on the target again so it doesn't grab the device later.
 			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), ReleaseTimeout)
 			_, _ = s.Nodes[target].Release(rctx, mac)
 			rcancel()
@@ -263,11 +266,11 @@ func (s *Switcher) switchChannel(ctx context.Context, d config.Device, target, h
 	rep.Acquired = <-done
 	s.logResults("acquire", []HostResult{rep.Acquired}, since(t))
 	if err := rep.Acquired.Err; err != nil {
-		switch {
-		case holder == "":
+		switch holder {
+		case "":
 			return rep, fmt.Errorf("%s could not connect: %w (no computer has %s connected, so btshare can't change its channel: press its channel button to select channel %d)",
 				target, err, d.Name, tgt.Channel)
-		case holder == target:
+		case target:
 			return rep, fmt.Errorf("%s could not connect: %w", target, err)
 		default:
 			back := ""
@@ -304,11 +307,23 @@ func (s *Switcher) NextTarget(d config.Device, results []HostResult) (string, er
 	if err != nil {
 		from = s.Self
 	}
-	usable := map[string]bool{}
+	return s.nextAfter(from, func(h string) bool { return usableOn(d, results, h) })
+}
+
+// usableOn reports whether host h can take the device: it answered, knows
+// the device and, for a multi-channel device, has a channel for it.
+func usableOn(d config.Device, results []HostResult, h string) bool {
+	_, hasChannel := d.On(h)
 	for _, r := range results {
-		_, hasChannel := d.On(r.Host)
-		usable[r.Host] = r.Err == nil && r.State.Known && (hasChannel || !d.MultiChannel())
+		if r.Host == h {
+			return r.Err == nil && r.State.Known && (hasChannel || !d.MultiChannel())
+		}
 	}
+	return false
+}
+
+// nextAfter returns the first host after from, in cycle order, that is usable.
+func (s *Switcher) nextAfter(from string, usable func(string) bool) (string, error) {
 	start := 0
 	for i, h := range s.Order {
 		if h == from {
@@ -317,7 +332,7 @@ func (s *Switcher) NextTarget(d config.Device, results []HostResult) (string, er
 	}
 	for k := 1; k <= len(s.Order); k++ {
 		h := s.Order[(start+k)%len(s.Order)]
-		if h != from && usable[h] {
+		if h != from && usable(h) {
 			return h, nil
 		}
 	}
@@ -336,4 +351,104 @@ func (s *Switcher) Next(ctx context.Context, d config.Device) (*Report, error) {
 	}
 	holder, _ := Holder(results)
 	return s.switchFrom(ctx, d, target, holder)
+}
+
+// DeviceResult is one device's outcome of NextAll.
+type DeviceResult struct {
+	Device config.Device
+	Report *Report // nil if the device was skipped or failed before switching
+	// Skipped is set when the device was left where it is on purpose, and
+	// says why (it is already on the target, or connected nowhere).
+	Skipped string
+	Err     error
+}
+
+// ErrNothingHere is returned by NextAll when no device is connected to this
+// computer, so there is nothing for it to send away.
+var ErrNothingHere = errors.New("no shared device is connected to this computer, so there is nothing to send (run `btshare here` to bring devices here)")
+
+// NextAll sends the devices connected to this computer to the next computer
+// in cycle order, all to the same one. A computer only moves what it has:
+// devices connected to other computers, or to none (usually turned off),
+// are left alone, so a press on one computer never takes a device away
+// from another.
+func (s *Switcher) NextAll(ctx context.Context, devs []config.Device) (string, []DeviceResult, error) {
+	statuses := make([][]HostResult, len(devs))
+	holders := make([]string, len(devs))
+	mine := false
+	for i, d := range devs {
+		t := time.Now()
+		statuses[i] = s.Status(ctx, d)
+		s.logResults("status "+d.Name, statuses[i], since(t))
+		holders[i], _ = Holder(statuses[i])
+		mine = mine || holders[i] == s.Self
+	}
+	if !mine {
+		s.logf("next: %v", ErrNothingHere)
+		return "", nil, ErrNothingHere
+	}
+	target, err := s.nextAfter(s.Self, func(h string) bool {
+		for i, d := range devs {
+			if holders[i] == s.Self && usableOn(d, statuses[i], h) {
+				return true
+			}
+		}
+		return false
+	})
+	if err != nil {
+		err = errors.New("no other reachable computer has the devices connected here paired")
+		s.logf("next: %v", err)
+		return "", nil, err
+	}
+	s.logf("next: devices on %q -> %q", s.Self, target)
+
+	// The devices move in parallel: one that is slow or failing (e.g. a
+	// 15s connect timeout) mustn't delay the others.
+	out := make([]DeviceResult, len(devs))
+	var wg sync.WaitGroup
+	for i, d := range devs {
+		r := &out[i]
+		r.Device = d
+		switch {
+		case holders[i] == "":
+			r.Skipped = "not connected to any computer (turned off?)"
+		case holders[i] != s.Self:
+			r.Skipped = "on " + holders[i] + ", not this computer"
+		case !usableOn(d, statuses[i], target):
+			r.Err = fmt.Errorf("not set up on %s (%s)", target, whyNotUsable(d, statuses[i], target))
+		default:
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				r.Report, r.Err = s.switchFrom(ctx, d, target, holders[i])
+			}()
+		}
+		if r.Skipped != "" {
+			s.logf("next %s: left on %q: %s", d.Name, holders[i], r.Skipped)
+		}
+	}
+	wg.Wait()
+	return target, out, nil
+}
+
+// whyNotUsable explains why host h can't take the device.
+func whyNotUsable(d config.Device, results []HostResult, h string) string {
+	for _, r := range results {
+		if r.Host != h {
+			continue
+		}
+		switch {
+		case r.Err != nil:
+			return fmt.Sprintf("unreachable: %v", r.Err)
+		case !r.State.Known:
+			if d.MultiChannel() {
+				return "not paired there"
+			}
+			return "not paired there: copy the pairing with `btshare keys export` / `keys import`"
+		}
+	}
+	if _, ok := d.On(h); d.MultiChannel() && !ok {
+		return fmt.Sprintf("no channel registered: run `btshare device add %s` there with it connected", d.Name)
+	}
+	return "unknown host"
 }

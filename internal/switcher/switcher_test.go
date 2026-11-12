@@ -108,15 +108,17 @@ func (f *fakeHost) Acquire(ctx context.Context, _ string) (bluez.DeviceState, er
 		f.w.mu.Lock()
 		if !f.failConn && f.w.channel == f.channel && (f.w.holder == "" || f.w.holder == f.name) {
 			f.w.holder = f.name
-			defer f.w.mu.Unlock()
-			return f.st(), nil
+			st := f.st()
+			f.w.mu.Unlock()
+			return st, nil
 		}
 		f.w.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			f.w.mu.Lock()
-			defer f.w.mu.Unlock()
-			return f.st(), errors.New("page timeout")
+			st := f.st()
+			f.w.mu.Unlock()
+			return st, errors.New("page timeout")
 		case <-time.After(time.Millisecond):
 		}
 	}
@@ -348,5 +350,123 @@ func TestChannelSwitchHolderFails(t *testing.T) {
 	}
 	if w.holder != "pc1" {
 		t.Fatalf("holder=%s", w.holder)
+	}
+}
+
+// ---- several devices at once ----
+
+// macRouter is one host with several devices: each MAC goes to the fake
+// host of that device's world.
+type macRouter map[string]*fakeHost
+
+func (m macRouter) State(ctx context.Context, mac string) (bluez.DeviceState, error) {
+	return m[mac].State(ctx, mac)
+}
+
+func (m macRouter) Release(ctx context.Context, mac string) (bluez.DeviceState, error) {
+	return m[mac].Release(ctx, mac)
+}
+
+func (m macRouter) Acquire(ctx context.Context, mac string) (bluez.DeviceState, error) {
+	return m[mac].Acquire(ctx, mac)
+}
+
+func (m macRouter) SetChannel(ctx context.Context, mac string, ch int) error {
+	return m[mac].SetChannel(ctx, mac, ch)
+}
+
+const mac2 = "AA:BB:CC:DD:EE:01"
+
+// twoDevices sets up hosts pc1 and pc2 (self is the one running the
+// command) sharing a multi-channel mouse "mx" (pc1 channel 1, pc2 channel
+// 2) and a single-host mouse "mou".
+func twoDevices(t *testing.T, self, mxHolder, mouHolder string) (s *Switcher, mx, mou *world, devs []config.Device, mouHosts map[string]*fakeHost) {
+	mx = &world{t: t, holder: mxHolder}
+	mou = &world{t: t, holder: mouHolder}
+	mx.channel = map[string]int{"pc1": 1, "pc2": 2, "": 1}[mxHolder]
+	s = &Switcher{Nodes: map[string]node.Node{}, Self: self, Order: []string{"pc1", "pc2"}}
+	mxDev := config.Device{Name: "mx", MAC: mac}
+	mouHosts = map[string]*fakeHost{}
+	for i, h := range s.Order {
+		a := &fakeHost{w: mx, name: h, known: true, channel: i + 1}
+		b := &fakeHost{w: mou, name: h, known: true, blocked: h != mouHolder}
+		mouHosts[h] = b
+		s.Nodes[h] = macRouter{mac: a, mac2: b}
+		mxDev.Hosts = append(mxDev.Hosts, config.DeviceHost{Host: h, MAC: mac, Channel: i + 1})
+	}
+	return s, mx, mou, []config.Device{mxDev, {Name: "mou", MAC: mac2}}, mouHosts
+}
+
+func TestNextAllMovesOnlyWhatIsHere(t *testing.T) {
+	// The mice sit on different computers. next on pc1 sends pc1's mouse
+	// away and leaves the one on pc2 alone.
+	s, mx, mou, devs, _ := twoDevices(t, "pc1", "pc2", "pc1")
+	target, res, err := s.NextAll(context.Background(), devs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "pc2" || mou.holder != "pc2" || mx.holder != "pc2" || len(mx.events) != 0 {
+		t.Fatalf("target=%s mou on %s, mx on %s, mx events %v", target, mou.holder, mx.holder, mx.events)
+	}
+	if res[0].Skipped == "" || res[1].Err != nil {
+		t.Fatalf("mx skipped=%q, mou err=%v", res[0].Skipped, res[1].Err)
+	}
+
+	// Now both are on pc2: pc1 has nothing to send...
+	if _, _, err := s.NextAll(context.Background(), devs); !errors.Is(err, ErrNothingHere) {
+		t.Fatalf("err=%v, want ErrNothingHere", err)
+	}
+	// ...and next on pc2 sends both to pc1 together.
+	s.Self = "pc2"
+	if target, _, err = s.NextAll(context.Background(), devs); err != nil || target != "pc1" || mx.holder != "pc1" || mou.holder != "pc1" {
+		t.Fatalf("err=%v target=%s mx on %s, mou on %s", err, target, mx.holder, mou.holder)
+	}
+}
+
+func TestNextAllSkipsDeviceConnectedNowhere(t *testing.T) {
+	// The mx is turned off; only the mou is in use.
+	s, mx, mou, devs, _ := twoDevices(t, "pc2", "", "pc2")
+	target, res, err := s.NextAll(context.Background(), devs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "pc1" || mou.holder != "pc1" {
+		t.Fatalf("target=%s mou on %s", target, mou.holder)
+	}
+	if res[0].Skipped == "" || res[0].Err != nil || len(mx.events) != 0 {
+		t.Fatalf("mx: skipped=%q err=%v events=%v; want it left alone", res[0].Skipped, res[0].Err, mx.events)
+	}
+}
+
+func TestNextAllNamesHostWithoutPairing(t *testing.T) {
+	s, _, mou, devs, mouHosts := twoDevices(t, "pc1", "pc1", "pc1")
+	mouHosts["pc2"].known = false // pairing never copied to pc2
+	target, res, err := s.NextAll(context.Background(), devs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "pc2" || res[0].Err != nil {
+		t.Fatalf("target=%s mx err=%v", target, res[0].Err)
+	}
+	if res[1].Err == nil || !strings.Contains(res[1].Err.Error(), "pc2") || !strings.Contains(res[1].Err.Error(), "keys") {
+		t.Fatalf("mou err=%v; want it to name pc2 and the keys commands", res[1].Err)
+	}
+	if mou.holder != "pc1" || len(mou.events) != 0 {
+		t.Fatalf("mou on %s, events %v; want it untouched", mou.holder, mou.events)
+	}
+}
+
+func TestFailedSwitchWithNoHolderSaysWhereItCanGo(t *testing.T) {
+	// The device is asleep (connected nowhere) and pc2 can't reach it: it
+	// must end up free to connect to pc2 only, and the error must say so.
+	pc1 := &fakeHost{name: "pc1", known: true}
+	pc2 := &fakeHost{name: "pc2", known: true, blocked: true, failConn: true}
+	s, w := setup(t, "", pc1, pc2)
+	_, err := s.Switch(context.Background(), dev, "pc2")
+	if err == nil || !strings.Contains(err.Error(), "only to pc2") {
+		t.Fatalf("err=%v", err)
+	}
+	if w.holder != "" || pc2.blocked || !pc1.blocked {
+		t.Fatalf("holder=%q pc1.blocked=%v pc2.blocked=%v", w.holder, pc1.blocked, pc2.blocked)
 	}
 }

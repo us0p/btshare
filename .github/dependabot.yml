@@ -1,0 +1,12 @@
+# Weekly pull requests to update Go modules and the GitHub Actions used by CI;
+# CI then checks each update before it's merged.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

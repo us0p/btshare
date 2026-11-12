@@ -142,19 +142,28 @@ shred -u mouse.bundle.json
   Not every controller supports this; btshare checks and tells you. The change
   is lost on reboot, so use `contrib/btshare-bdaddr.service` to apply it at boot.
 - Two adapters with the same address can both answer a device that's reconnecting.
-  Released computers block the device, so they reject it. If a switch is
-  flaky, run it again or move the mouse so it wakes up.
+  Released computers untrust the device, which takes it off their kernel's
+  auto-connect list, so only the target tries to connect. If a
+  switch is flaky, run it again or move the mouse so it wakes up.
 
 ### 5. Switch
 
 ```sh
 btshare status                # who has what
 btshare switch mouse laptop   # move it to a specific computer
-btshare next mouse            # cycle to the next computer (what the hotkey runs)
+btshare next                  # send what's connected here to the next computer (what the hotkey runs)
+btshare next mouse            # move just this one to the computer after the one that has it
 btshare here                  # pull every shared device to this computer
 ```
 
 Any computer can run these, including one that doesn't have the device.
+
+`btshare next` only moves what is connected to the computer it runs on:
+all of those devices go to the next computer together. Devices connected to
+another computer are left alone, so a press on one computer never takes a
+device away from another. So are devices connected nowhere (usually turned
+off), so switching doesn't stall waiting for them. If nothing is connected
+here, `next` does nothing and says so; use `btshare here` to pull devices in.
 
 ### Managing devices
 
@@ -162,7 +171,10 @@ Any computer can run these, including one that doesn't have the device.
 btshare device remove mouse    # stop sharing it, on every computer
 ```
 
-Removing never touches Bluetooth pairings (`bluetoothctl remove <MAC>` does).
+Removing never touches Bluetooth pairings (`bluetoothctl remove <MAC>` does),
+but it trusts the device again on every computer (and unblocks it, if an
+older btshare blocked it), so one that btshare had released reconnects there
+by itself again.
 If a single-host device was re-paired and got a new address (some Logitech
 mice do), run `btshare device add` with the same name again. For a
 multi-channel device, re-run `device add` on the computer whose channel was re-paired.
@@ -216,6 +228,27 @@ meanwhile (`Connected`, `ServicesResolved`, ...). Read it with
 A connect that stays "pending" with no property changes means the device was
 never heard from: it isn't advertising to this computer.
 
+Single-host devices:
+
+- *"is free to connect only to X now"*: the switch failed and nothing could
+  take the device back (it was asleep, or the rollback failed too). It is
+  trusted on X and released everywhere else, so it isn't lost: click or move
+  it to wake it and it connects to X. To have it elsewhere, run `btshare here`
+  on that computer. Don't forget and re-pair it: that gives it new keys (and,
+  for some mice, a new address), so every computer needs the keys again.
+- *"a switch is already running on this computer"*: you pressed the hotkey
+  (or button) again while a switch was still connecting. Switches on one
+  computer run one at a time, so two can't fight over a device and leave it
+  released everywhere. Wait for the first to finish or fail (under a minute).
+- *"not set up on X"* from `btshare next`: X doesn't have the pairing. Copy it
+  with `btshare keys export` / `keys import` (step 4b).
+
+Triggering a switch from a device's own button (for example a Solaar rule
+running `btshare -notify next`) works best with `next` and no device name:
+everything on that computer moves together, so the mouse with the button
+comes along and you can press it again on the other computer. Keep the keyboard shortcut set up
+on every computer as a fallback.
+
 Multi-channel devices:
 
 - *"is not connected to this computer"* on `device add`: connect it first;
@@ -241,10 +274,17 @@ send it *setCurrentHost(target's channel)*. The device drops that computer and
 connects to the target by itself. Nothing is blocked, so the device's own
 button keeps working.
 
-**Single-host devices.** A switch first asks the **target** to *acquire* the device (`Blocked=false`,
-`Trusted=true`, `Connect()` with retries), and after a 0.5 s head start asks every
-**other** computer to *release* it (`Disconnect()` + `Blocked=true`, keeping the
-bond). The target is already listening when the device drops its old
+**Single-host devices.** A switch first asks the **target** to *acquire* the device
+(`Trusted=true`, `Connect()` with retries), and after a 0.5 s head start asks every
+**other** computer to *release* it (`Trusted=false`, then `Disconnect()`, keeping
+the bond). Untrusting before `Disconnect()` makes BlueZ take the device off the
+kernel's auto-connect list, so the released computer doesn't race the target
+for the device every time it advertises. The device isn't blocked: a BlueZ
+block doesn't stop the kernel's auto-connect, and after a block and unblock
+BlueZ rebuilds the device's HID service, after which a mouse's clicks arrive
+but its movement doesn't until it reconnects. (A device that an older btshare
+left blocked is unblocked and connected twice on its first acquire, for that
+reason.) The target is already listening when the device drops its old
 connection, which matters for BLE devices that advertise only briefly after a
 disconnect. If the target can't connect, the device is handed back the same way.
 Offline computers are skipped. Requests are signed with HMAC-SHA256 using the
@@ -264,3 +304,18 @@ clocks in sync with NTP. Agents only touch devices listed in their config.
 | `internal/switcher` | Switch / next logic |
 | `internal/keys` | Export/import of BlueZ bonds |
 | `internal/hidpp` | Multi-channel detection and switching (Logitech HID++ 2.0) |
+
+## Contributing
+
+CI (`.github/workflows/ci.yml`) runs on every push and pull request, and
+weekly: golangci-lint with the formatters (`.golangci.yml`), unit tests with
+the race detector on the minimum Go version from `go.mod` and on the latest
+release, `go mod tidy`/`verify`, a build, shellcheck on `install.sh`, and
+govulncheck. Run the same checks locally before pushing:
+
+```sh
+make fmt     # format Go code (gofmt + goimports)
+make check   # everything CI runs (shellcheck must be installed)
+```
+
+`.editorconfig` sets indentation and line endings for most editors.

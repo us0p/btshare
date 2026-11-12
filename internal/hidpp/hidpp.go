@@ -10,6 +10,7 @@
 package hidpp
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -138,7 +139,7 @@ func SetChannel(mac string, channel int) error {
 			return nil // already there
 		}
 		// No reply comes back: the device leaves as soon as it gets this.
-		return d.send(idx, 1, []byte{byte(channel - 1)})
+		return d.send(idx, 1, []byte{byte(channel - 1)}) //nolint:gosec // channel is 1..n above, n came from a byte
 	})
 }
 
@@ -150,7 +151,7 @@ func withDevice(mac string, fn func(*device, byte) error) error {
 	if err != nil {
 		return err
 	}
-	var lastErr error = ErrNotSupported
+	lastErr := ErrNotSupported
 	for _, n := range nodes {
 		if n.vendor != logitech {
 			continue
@@ -212,7 +213,7 @@ func (d *device) send(feat, fn byte, params []byte) error {
 	copy(msg[4:], params)
 	if _, err := d.f.Write(msg); err != nil {
 		// A device without the HID++ long report rejects the write.
-		return fmt.Errorf("%w (%v)", ErrNotSupported, err)
+		return fmt.Errorf("%w (%w)", ErrNotSupported, err)
 	}
 	return nil
 }
@@ -251,7 +252,7 @@ func (d *device) request(feat, fn byte, params []byte) ([]byte, error) {
 // featureIndex looks up a feature through the root feature; ErrNotSupported
 // if the device doesn't have it.
 func (d *device) featureIndex(id uint16) (byte, error) {
-	r, err := d.request(featureRoot, 0, []byte{byte(id >> 8), byte(id)})
+	r, err := d.request(featureRoot, 0, binary.BigEndian.AppendUint16(nil, id))
 	if err != nil {
 		return 0, err
 	}
