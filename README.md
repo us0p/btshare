@@ -142,8 +142,9 @@ shred -u mouse.bundle.json
   Not every controller supports this; btshare checks and tells you. The change
   is lost on reboot, so use `contrib/btshare-bdaddr.service` to apply it at boot.
 - Two adapters with the same address can both answer a device that's reconnecting.
-  Released computers block the device, so they reject it. If a switch is
-  flaky, run it again or move the mouse so it wakes up.
+  Released computers untrust and block the device, which also takes it off
+  their kernel's auto-connect list, so only the target tries to connect. If a
+  switch is flaky, run it again or move the mouse so it wakes up.
 
 ### 5. Switch
 
@@ -274,8 +275,11 @@ button keeps working.
 
 **Single-host devices.** A switch first asks the **target** to *acquire* the device (`Blocked=false`,
 `Trusted=true`, `Connect()` with retries), and after a 0.5 s head start asks every
-**other** computer to *release* it (`Disconnect()` + `Blocked=true`, keeping the
-bond). The target is already listening when the device drops its old
+**other** computer to *release* it (`Trusted=false`, `Disconnect()`,
+`Blocked=true`, keeping the bond). Untrusting before `Disconnect()` is what
+makes BlueZ take the device off the kernel's auto-connect list; a block alone
+doesn't, and the released computer's kernel would keep racing the target for
+the device every time it advertises. The target is already listening when the device drops its old
 connection, which matters for BLE devices that advertise only briefly after a
 disconnect. If the target can't connect, the device is handed back the same way.
 Offline computers are skipped. Requests are signed with HMAC-SHA256 using the
