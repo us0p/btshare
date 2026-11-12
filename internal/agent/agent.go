@@ -222,8 +222,8 @@ func (s *Server) removeDevice(w http.ResponseWriter, r *http.Request, body []byt
 		return
 	}
 	s.logf("device removed: %s %s from %s (was present=%v)", req.Device.Name, req.Device.MAC, r.RemoteAddr, removed)
-	// btshare no longer manages it, so don't leave it blocked here by an
-	// earlier release (multi-channel devices are never blocked).
+	// btshare no longer manages it, so don't leave it untrusted (or blocked)
+	// here by an earlier release (multi-channel devices are never released).
 	if u, ok := s.Node.(unblocker); ok && removed && !req.Device.MultiChannel() {
 		st, err := u.Unblock(r.Context(), req.Device.MAC)
 		s.logf("device removed: unblock %s -> blocked=%v err=%v", req.Device.MAC, st.Blocked, err)
