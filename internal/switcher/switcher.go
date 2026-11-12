@@ -6,13 +6,14 @@
 // like pressing its channel button. Nothing is released or blocked.
 //
 // Single-host devices have one pairing that every computer shares. The target starts
-// acquiring first (unblocked and waiting for the device), then every other
+// acquiring first (trusted and waiting for the device), then every other
 // host releases it: a BLE device sends only a short burst of reconnection
 // advertising right after a disconnect, so the target must already be
 // listening when that happens. If the target can't connect, the device is
 // handed back to the host that had it the same way. A device holds one
-// connection at a time, and hosts that release it block it, so it never
-// ends up connected to two hosts.
+// connection at a time, and hosts that release it stop reconnecting it (they
+// untrust it, see bluez.Client.Release), so it never ends up connected to two
+// hosts.
 package switcher
 
 import (
@@ -108,7 +109,7 @@ func (s *Switcher) forEachHost(ctx context.Context, timeout time.Duration, hosts
 //
 // If the target can't connect, the device is released there again and
 // reconnected to the host that held it before (see Report.Restored), so a
-// failed switch doesn't leave it blocked everywhere.
+// failed switch doesn't leave it released everywhere.
 //
 // Release failures on other hosts are reported but don't abort: an
 // unreachable host is usually powered off and therefore can't be holding
@@ -147,8 +148,8 @@ func (s *Switcher) switchFrom(ctx context.Context, d config.Device, target, hold
 	if err := rep.Acquired.Err; err != nil {
 		err = fmt.Errorf("%s could not connect: %w", target, err)
 		if holder == "" || holder == target {
-			// Nothing to hand back to. The target is left unblocked and every
-			// other host blocked, so the device can only go to the target.
+			// Nothing to hand back to. The target is left trusted and every
+			// other host released, so the device can only go to the target.
 			return rep, fmt.Errorf("%w; it is free to connect only to %s now: click or move it to wake it (or run `btshare here` on the computer you want it on)", err, target)
 		}
 		return rep, s.restore(ctx, rep, mac, target, holder, err)
@@ -158,11 +159,11 @@ func (s *Switcher) switchFrom(ctx context.Context, d config.Device, target, hold
 
 // restore hands the device back to holder after target failed to connect.
 // It runs even if ctx was canceled (e.g. Ctrl+C mid-switch): stopping here
-// would leave the device blocked on every host.
+// would leave the device released on every host.
 func (s *Switcher) restore(ctx context.Context, rep *Report, mac, target, holder string, cause error) error {
 	ctx = context.WithoutCancel(ctx)
 	// Same handoff in reverse: the holder starts acquiring, then the target
-	// is blocked again so it can't grab the device late.
+	// releases it again so it can't grab the device late.
 	s.logf("switch %s: rolling back to %s", mac, holder)
 	_, acquired, aerr := s.handoff(ctx, mac, holder, []string{target})
 	rep.Restored = &acquired
@@ -209,7 +210,7 @@ func (s *Switcher) handoff(ctx context.Context, mac, target string, from []strin
 			s.logf("switch %s: aborted, %s still holds it", mac, r.Host)
 			cancel()
 			<-done
-			// Undo the target's unblock so it doesn't grab the device later.
+			// Release it on the target again so it doesn't grab the device later.
 			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), ReleaseTimeout)
 			_, _ = s.Nodes[target].Release(rctx, mac)
 			rcancel()

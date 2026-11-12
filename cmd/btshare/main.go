@@ -545,7 +545,7 @@ func runDevice(ctx context.Context, args []string) error {
 				fmt.Fprintf(os.Stderr, "warning: could not unblock it here: %v (run: bluetoothctl unblock %s)\n", err, d.MAC)
 			}
 		}
-		fmt.Printf("its Bluetooth pairing is kept and it is no longer blocked; to forget it too: bluetoothctl remove %s (on each computer)\n", d.MAC)
+		fmt.Printf("its Bluetooth pairing is kept and it is no longer released (blocked or untrusted) here; to forget it too: bluetoothctl remove %s (on each computer)\n", d.MAC)
 		return nil
 	}
 	return fmt.Errorf("unknown device subcommand %q", args[0])
@@ -647,7 +647,7 @@ func describe(r switcher.HostResult) string {
 		return "not paired"
 	case r.State.Connected:
 		return "CONNECTED"
-	case r.State.Blocked:
+	case r.State.Blocked || !r.State.Trusted:
 		return "released"
 	default:
 		return "not connected"
@@ -658,8 +658,8 @@ func describe(r switcher.HostResult) string {
 // target is a host name, "@next" or "@here".
 // switchLock makes switches on this computer run one at a time. A second
 // press of the hotkey while one is running would otherwise race it: each
-// releases and blocks the device the other is connecting, and it can end up
-// blocked on every computer. The lock is released when the process exits.
+// releases the device the other is connecting, and it can end up released
+// on every computer. The lock is released when the process exits.
 func switchLock() error {
 	dir := os.Getenv("XDG_RUNTIME_DIR")
 	if dir == "" {

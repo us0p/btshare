@@ -33,6 +33,9 @@ type DeviceState struct {
 	Paired    bool   `json:"paired"`
 	Connected bool   `json:"connected"`
 	Blocked   bool   `json:"blocked"`
+	// Trusted is false on a computer that released the device: BlueZ then
+	// doesn't reconnect it by itself (see Release).
+	Trusted bool `json:"trusted"`
 }
 
 // Client talks to BlueZ on the system bus for one adapter (e.g. "hci0").
@@ -117,6 +120,7 @@ func (c *Client) State(mac string) (DeviceState, error) {
 	st.Paired, _ = props["Paired"].Value().(bool)
 	st.Connected, _ = props["Connected"].Value().(bool)
 	st.Blocked, _ = props["Blocked"].Value().(bool)
+	st.Trusted, _ = props["Trusted"].Value().(bool)
 	return st, nil
 }
 
@@ -224,8 +228,12 @@ func dbusErr(err error) string {
 	return err.Error()
 }
 
-// Release disconnects the device and blocks it so it cannot auto-reconnect
-// to this host. The pairing keys are kept.
+// Release disconnects the device and stops this host from reconnecting it.
+// The pairing keys are kept.
+//
+// It doesn't block the device: after a block and unblock, BlueZ rebuilds the
+// device's HID service, and on the first connection after that a mouse's
+// clicks arrive but its movement doesn't (tested with BlueZ 5.85).
 func (c *Client) Release(mac string) (DeviceState, error) {
 	c.logf("release %s: before: %s", mac, c.describe(mac))
 	st, err := c.State(mac)
@@ -236,14 +244,13 @@ func (c *Client) Release(mac string) (DeviceState, error) {
 	}
 	defer c.watch(mac)()
 	p := c.devicePath(mac)
-	// Blocking alone doesn't stop this host from grabbing the device back:
-	// the kernel connects LE devices on its auto-connect list by itself,
-	// ignores BlueZ's block while doing so, and races the target for the
-	// device every time it advertises. BlueZ takes a device off that list
-	// when Disconnect is called on it while it is untrusted ("disable
-	// connections through passive scanning until Device1.Connect is
-	// called"), so untrust it first, then call Disconnect even when it is
-	// not connected. That also cancels a Connect still pending from an
+	// The kernel connects LE devices on its auto-connect list by itself
+	// (ignoring even a BlueZ block), so a released host would race the
+	// target for the device every time it advertises. BlueZ takes a device
+	// off that list when Disconnect is called on it while it is untrusted
+	// ("disable connections through passive scanning until Device1.Connect
+	// is called"), so untrust it first, then call Disconnect even when it
+	// is not connected. That also cancels a Connect still pending from an
 	// earlier acquire. Acquire trusts it again.
 	if err := c.setProp(p, ifaceDevice, "Trusted", false); err != nil {
 		c.logf("release %s: untrust failed: %s", mac, dbusErr(err))
@@ -255,27 +262,26 @@ func (c *Client) Release(mac string) (DeviceState, error) {
 		return st, fmt.Errorf("disconnect: %w", err)
 	}
 	c.logf("release %s: Disconnect ok in %s (was connected=%v)", mac, since(t), st.Connected)
-	if err := c.setProp(p, ifaceDevice, "Blocked", true); err != nil {
-		c.logf("release %s: block failed: %s", mac, dbusErr(err))
-		return st, fmt.Errorf("block: %w", err)
-	}
 	c.logf("release %s: after: %s", mac, c.describe(mac))
 	return c.State(mac)
 }
 
 // Unblock lets the device connect to this host again, without connecting
-// it. Used when btshare stops managing a device, so it isn't left blocked.
-// It also trusts it again (Release untrusted it), which puts it back on the
-// kernel's auto-connect list so it reconnects by itself like any device.
+// it. Used when btshare stops managing a device, so a release doesn't leave
+// it untrusted (or blocked, by an older version) here. Trusting it puts it
+// back on the kernel's auto-connect list, so it reconnects by itself like
+// any device.
 func (c *Client) Unblock(mac string) (DeviceState, error) {
 	st, err := c.State(mac)
-	if err != nil || !st.Known || !st.Blocked {
+	if err != nil || !st.Known || (!st.Blocked && st.Trusted) {
 		return st, err
 	}
 	p := c.devicePath(mac)
-	if err := c.setProp(p, ifaceDevice, "Blocked", false); err != nil {
-		c.logf("unblock %s: %s", mac, dbusErr(err))
-		return st, fmt.Errorf("unblock: %w", err)
+	if st.Blocked {
+		if err := c.setProp(p, ifaceDevice, "Blocked", false); err != nil {
+			c.logf("unblock %s: %s", mac, dbusErr(err))
+			return st, fmt.Errorf("unblock: %w", err)
+		}
 	}
 	if err := c.setProp(p, ifaceDevice, "Trusted", true); err != nil {
 		c.logf("unblock %s: trust: %s", mac, dbusErr(err))
@@ -287,7 +293,7 @@ func (c *Client) Unblock(mac string) (DeviceState, error) {
 
 func since(t time.Time) time.Duration { return time.Since(t).Round(10 * time.Millisecond) }
 
-// Acquire unblocks, trusts and connects the device, retrying until ctx expires
+// Acquire trusts and connects the device, retrying until ctx expires
 // (the device may need a moment to notice the previous host let go).
 func (c *Client) Acquire(ctx context.Context, mac string) (DeviceState, error) {
 	start := time.Now()
@@ -309,7 +315,9 @@ func (c *Client) Acquire(ctx context.Context, mac string) (DeviceState, error) {
 	}
 	defer c.watch(mac)()
 	p := c.devicePath(mac)
-	if st.Blocked {
+	// Older btshare versions blocked the device on release.
+	wasBlocked := st.Blocked
+	if wasBlocked {
 		if err := c.setProp(p, ifaceDevice, "Blocked", false); err != nil {
 			c.logf("acquire %s: unblock failed: %s", mac, dbusErr(err))
 			return st, fmt.Errorf("unblock: %w", err)
@@ -320,10 +328,30 @@ func (c *Client) Acquire(ctx context.Context, mac string) (DeviceState, error) {
 		c.logf("acquire %s: trust failed: %s", mac, dbusErr(err))
 		return st, fmt.Errorf("trust: %w", err)
 	}
+	st, err = c.connect(ctx, mac, start)
+	if err != nil || !wasBlocked {
+		return st, err
+	}
+	// Unblocking made BlueZ rebuild the device's HID service, and on this
+	// first connection a mouse's clicks arrive but its movement doesn't.
+	// Connecting once more fixes that; the device is awake now, so it
+	// reconnects quickly.
+	c.logf("acquire %s: reconnecting once, as the first connection after an unblock doesn't deliver mouse movement", mac)
+	if err := c.obj(p).Call(ifaceDevice+".Disconnect", 0).Err; err != nil {
+		c.logf("acquire %s: Disconnect failed: %s", mac, dbusErr(err))
+		return st, nil // connected, if only partly working; don't fail the switch
+	}
+	return c.connect(ctx, mac, start)
+}
 
+// connect calls Device1.Connect until the device is connected or ctx
+// expires. start is when the acquire began, for the log.
+func (c *Client) connect(ctx context.Context, mac string, start time.Time) (DeviceState, error) {
+	p := c.devicePath(mac)
 	var lastErr error
 	for attempt := 1; ; attempt++ {
-		if st, err = c.State(mac); err == nil && st.Connected {
+		st, err := c.State(mac)
+		if err == nil && st.Connected {
 			c.logf("acquire %s: connected (by auto-reconnect) after %s", mac, since(start))
 			return st, nil
 		}

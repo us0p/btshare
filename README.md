@@ -142,8 +142,8 @@ shred -u mouse.bundle.json
   Not every controller supports this; btshare checks and tells you. The change
   is lost on reboot, so use `contrib/btshare-bdaddr.service` to apply it at boot.
 - Two adapters with the same address can both answer a device that's reconnecting.
-  Released computers untrust and block the device, which also takes it off
-  their kernel's auto-connect list, so only the target tries to connect. If a
+  Released computers untrust the device, which takes it off their kernel's
+  auto-connect list, so only the target tries to connect. If a
   switch is flaky, run it again or move the mouse so it wakes up.
 
 ### 5. Switch
@@ -172,8 +172,9 @@ btshare device remove mouse    # stop sharing it, on every computer
 ```
 
 Removing never touches Bluetooth pairings (`bluetoothctl remove <MAC>` does),
-but it unblocks the device on every computer, so one that btshare had
-released isn't left unusable there.
+but it trusts the device again on every computer (and unblocks it, if an
+older btshare blocked it), so one that btshare had released reconnects there
+by itself again.
 If a single-host device was re-paired and got a new address (some Logitech
 mice do), run `btshare device add` with the same name again. For a
 multi-channel device, re-run `device add` on the computer whose channel was re-paired.
@@ -231,14 +232,14 @@ Single-host devices:
 
 - *"is free to connect only to X now"*: the switch failed and nothing could
   take the device back (it was asleep, or the rollback failed too). It is
-  unblocked on X and blocked everywhere else, so it isn't lost: click or move
+  trusted on X and released everywhere else, so it isn't lost: click or move
   it to wake it and it connects to X. To have it elsewhere, run `btshare here`
   on that computer. Don't forget and re-pair it: that gives it new keys (and,
   for some mice, a new address), so every computer needs the keys again.
 - *"a switch is already running on this computer"*: you pressed the hotkey
   (or button) again while a switch was still connecting. Switches on one
   computer run one at a time, so two can't fight over a device and leave it
-  blocked everywhere. Wait for the first to finish or fail (under a minute).
+  released everywhere. Wait for the first to finish or fail (under a minute).
 - *"not set up on X"* from `btshare next`: X doesn't have the pairing. Copy it
   with `btshare keys export` / `keys import` (step 4b).
 
@@ -273,13 +274,17 @@ send it *setCurrentHost(target's channel)*. The device drops that computer and
 connects to the target by itself. Nothing is blocked, so the device's own
 button keeps working.
 
-**Single-host devices.** A switch first asks the **target** to *acquire* the device (`Blocked=false`,
-`Trusted=true`, `Connect()` with retries), and after a 0.5 s head start asks every
-**other** computer to *release* it (`Trusted=false`, `Disconnect()`,
-`Blocked=true`, keeping the bond). Untrusting before `Disconnect()` is what
-makes BlueZ take the device off the kernel's auto-connect list; a block alone
-doesn't, and the released computer's kernel would keep racing the target for
-the device every time it advertises. The target is already listening when the device drops its old
+**Single-host devices.** A switch first asks the **target** to *acquire* the device
+(`Trusted=true`, `Connect()` with retries), and after a 0.5 s head start asks every
+**other** computer to *release* it (`Trusted=false`, then `Disconnect()`, keeping
+the bond). Untrusting before `Disconnect()` makes BlueZ take the device off the
+kernel's auto-connect list, so the released computer doesn't race the target
+for the device every time it advertises. The device isn't blocked: a BlueZ
+block doesn't stop the kernel's auto-connect, and after a block and unblock
+BlueZ rebuilds the device's HID service, after which a mouse's clicks arrive
+but its movement doesn't until it reconnects. (A device that an older btshare
+left blocked is unblocked and connected twice on its first acquire, for that
+reason.) The target is already listening when the device drops its old
 connection, which matters for BLE devices that advertise only briefly after a
 disconnect. If the target can't connect, the device is handed back the same way.
 Offline computers are skipped. Requests are signed with HMAC-SHA256 using the
